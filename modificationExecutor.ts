@@ -343,7 +343,7 @@ Provide the complete modification plan. Think about:
             message: planningPrompt,
             session_id: 'modplan-' + Date.now(),
             temperature: 0.7,
-            max_tokens: 2000
+            max_tokens: 32000
         });
 
         statusBarManager.clearOperation();
@@ -744,7 +744,7 @@ Requirements:
             message: prompt,
             session_id: 'create-mod-' + Date.now(),
             temperature: 0.7,
-            max_tokens: 2000,
+            max_tokens: 32000,
             forCodeGeneration: true
         });
 
@@ -916,7 +916,7 @@ Do NOT include the entire file, only the new/modified code.
                 message: prompt,
                 session_id: 'modify-' + Date.now(),
                 temperature: 0.7,
-                max_tokens: 2000,
+                max_tokens: 32000,
                 forCodeGeneration: true
             });
 

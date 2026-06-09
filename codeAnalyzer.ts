@@ -159,7 +159,7 @@ export async function analyzeCode(client: BoudicaClient, diagnosticCollection: v
             const response = await client.chat({
                 message: analysisPrompt,
                 session_id: `code-analysis-${Date.now()}`,
-                max_tokens: 12000,
+                max_tokens: 32000,
                 temperature: 0.3, // Lower temperature for more consistent analysis
                 use_rag: true,
                 file_content: codeContext,

@@ -640,7 +640,7 @@ async function configureExtension(): Promise<void> {
         case 'maxtokens':
             const tokens = await vscode.window.showInputBox({
                 prompt: 'Enter max tokens (50-32000, default 2000)',
-                value: String(config.get('maxTokens', 2000)),
+                value: String(config.get('maxTokens', 32000)),
                 validateInput: (value) => {
                     const num = parseInt(value);
                     if (isNaN(num) || num < 50 || num > 32000) {

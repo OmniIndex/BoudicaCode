@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import { reportStatus } from './statusReporter';
 
 export interface FileInfo {
     path: string;
@@ -58,6 +59,7 @@ export class ProjectScanner implements vscode.Disposable {
         }
 
         console.log('[ProjectScanner] Scanning workspace...');
+        reportStatus('Scanning workspace...');
         
         if (!this.workspaceRoot) {
             console.log('[ProjectScanner] No workspace root found');
@@ -84,6 +86,7 @@ export class ProjectScanner implements vscode.Disposable {
 
             // Quick file count check to avoid scanning massive projects
             console.log('[ProjectScanner] Counting files...');
+            reportStatus('Counting files...');
             const allSourceFiles = await vscode.workspace.findFiles(
                 patterns.source,
                 '**/node_modules/**'
@@ -95,6 +98,7 @@ export class ProjectScanner implements vscode.Disposable {
             const totalFileCount = allSourceFiles.length + allHeaderFiles.length;
             
             console.log(`[ProjectScanner] Found ${totalFileCount} source/header files`);
+            reportStatus(`Found ${totalFileCount} source/header files`);
             
             // If project has more than 100 files, skip detailed scanning
             const MAX_FILES_FOR_SCANNING = 100;
@@ -160,6 +164,9 @@ export class ProjectScanner implements vscode.Disposable {
             console.log(`[ProjectScanner] Scan complete: ${structure.totalFiles} files found`);
             console.log(`  Source: ${structure.sourceFiles.length}, Headers: ${structure.headerFiles.length}`);
             console.log(`  Config: ${structure.configFiles.length}, Build: ${structure.buildFiles.length}`);
+            reportStatus(`Scan complete: ${structure.totalFiles} files found`);
+            reportStatus(`  Source: ${structure.sourceFiles.length}, Headers: ${structure.headerFiles.length}`);
+            reportStatus(`  Config: ${structure.configFiles.length}, Build: ${structure.buildFiles.length}`);
 
             this.cache = structure;
             return structure;

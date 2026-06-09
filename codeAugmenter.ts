@@ -165,7 +165,7 @@ export async function augmentCode(client: BoudicaClient, targetUri?: vscode.Uri)
             const response = await client.chat({
                 message: augmentationRequest,
                 session_id: `code-augmentation-${Date.now()}`,
-                max_tokens: 12000,
+                max_tokens: 32000,
                 temperature: 0.7,
                 use_rag: true,
                 file_content: codeContext,

@@ -137,7 +137,7 @@ export async function createProject(client: BoudicaClient): Promise<void> {
             const response = await client.chat({
                 message: prompt,
                 session_id: `project-creation-${Date.now()}`,
-                max_tokens: 8000,
+                max_tokens: 32000,
                 temperature: 0.7,
                 use_rag: true,
                 forCodeGeneration: true

@@ -66,7 +66,7 @@ export class FixGenerator {
                 file_name: fileContent.length > 0 ? fileName : undefined,
                 session_id: 'fix-' + Date.now(),
                 temperature: 0.3, // Lower temperature for more precise fixes
-                max_tokens: 2500,
+                max_tokens: 32000,
                 skipClean: true   // Don't let cleanResponse strip STEP lines
             });
             
@@ -201,7 +201,7 @@ Provide ONLY the STEP lines, nothing else.`;
                 message: reformatPrompt,
                 session_id: 'reformat-' + Date.now(),
                 temperature: 0.1, // Very low for exact formatting
-                max_tokens: 1000,
+                max_tokens: 32000,
                 skipClean: true   // Don't let cleanResponse strip STEP lines
             });
             

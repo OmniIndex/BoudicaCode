@@ -16,6 +16,7 @@ import { BuildRunner } from './buildRunner';
 import { ErrorParser, ParsedError } from './errorParser';
 import { FixGenerator } from './fixGenerator';
 import { CodeSearch } from './codeSearch';
+import { reportStatus, setStatusWebview } from './statusReporter';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'boudicodeChat';
@@ -83,9 +84,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         webviewView.webview.html = this.getHtmlContent(webviewView.webview);
         console.log('BoudiCode: HTML content set, setting up message handler...');
 
+        // Route status messages from anywhere in the extension into this webview.
+        setStatusWebview(webviewView.webview);
+
         // Listen for webview disposal (when user closes the panel)
         webviewView.onDidDispose(() => {
             console.log('[Extension] Webview disposed');
+            setStatusWebview(undefined);
             if (this.isCreatingFiles) {
                 vscode.window.showInformationMessage(
                     '⏳ BoudiCode: File creation continues in background. Check status bar for progress.',
@@ -340,6 +345,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const statusBarManager = getStatusBarManager();
         
         console.log('[Extension] handleSendMessage called with:', userMessage);
+        reportStatus('handleSendMessage called with: ' + userMessage);
         if (!userMessage.trim() || !this.view) {
             console.log('[Extension] Empty message or no view, returning');
             return;
@@ -358,6 +364,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const fileContext = await this.getActiveFileContext();
         let fileName: string | undefined;
         console.log('[Extension] File context length:', fileContext ? fileContext.length : 'none');
+        reportStatus('File context length: ' + (fileContext ? String(fileContext.length) : 'none'));
         
         // Show file context info to user
         let contextInfo = '';
@@ -389,30 +396,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         // Check if this is a build request
         if (this.isBuildRequest(userMessage)) {
+            console.log('[Extension] Route: build-and-fix');
             await this.handleBuildAndFix(userMessage);
             return;
         }
 
         // Check if this is a session search request
         if (SessionManager.isSessionSearchRequest(userMessage)) {
+            console.log('[Extension] Route: session search');
             await this.handleSessionSearch(userMessage);
             return;
         }
 
         // Check if this is a batch directory analysis request
         if (this.isDirectoryAnalysisRequest(userMessage)) {
+            console.log('[Extension] Route: directory analysis');
             await this.handleDirectoryAnalysis(userMessage);
             return;
         }
 
         // Check if this is a planning request (project creation)
         if (isPlanningRequest(userMessage)) {
+            console.log('[Extension] Route: PLANNING MODE (project creation)');
+            reportStatus('Route: PLANNING MODE (project creation)');
             await this.handlePlanningMode(userMessage, fileContext, fileName);
             return;
         }
 
         // Check if this is a modification request (existing project)
         if (isModificationRequest(userMessage)) {
+            console.log('[Extension] Route: modification mode');
             await this.handleModificationMode(userMessage);
             return;
         }
@@ -503,6 +516,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         content: summaryMessage
                     });
                 }
+            } else {
+                // response.response is empty — stream may have completed but server sent no usable content.
+                // Update the stream bubble with a helpful message so the user sees something.
+                console.warn('[Extension] Stream completed with empty response.response');
+                this.view.webview.postMessage({
+                    command: 'addMessage',
+                    role: 'error',
+                    content: '⚠️ The server returned an empty response. This may be due to a token limit, a network issue, or an unsupported request type.\n\nTry:\n• Rephrasing your request\n• Breaking it into smaller steps\n• Checking the Boudica server is running'
+                });
             }
         } catch (error: any) {
 
@@ -763,6 +785,364 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
+    /**
+     * Filenames / paths that may contain secrets and must NEVER be sent to the model.
+     * Match by basename (case-insensitive) or by path substring.
+     */
+    private static isSecretFile(relativePathOrName: string): boolean {
+        const name = path.basename(relativePathOrName).toLowerCase();
+        const lower = relativePathOrName.toLowerCase();
+
+        // Exact-name matches
+        const blockedNames = [
+            '.env', '.env.local', '.env.production', '.env.staging', '.env.development',
+            '.npmrc', '.pypirc', '.netrc', '.git-credentials',
+            'credentials', 'credentials.json', 'secrets', 'secrets.json',
+            'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519',
+            'authorized_keys', 'known_hosts',
+            'service-account.json', 'gcp-key.json', 'aws-credentials',
+            'config.local', 'local.settings.json'
+        ];
+        if (blockedNames.includes(name)) { return true; }
+
+        // Suffix / extension matches commonly used for keys
+        if (/\.(pem|key|crt|cer|pfx|p12|jks|keystore|asc|gpg|kdbx)$/i.test(name)) { return true; }
+
+        // Substring matches in basename
+        if (/(^|[_.\-])(secret|secrets|credential|credentials|password|passwords|apikey|api_key|token|tokens|private[_\-]?key)([_.\-]|$)/i.test(name)) {
+            return true;
+        }
+
+        // Path-based (e.g. .aws/, .ssh/, .config/gcloud/)
+        if (/(^|\/)(\.aws|\.ssh|\.gnupg|\.config\/gcloud|\.azure)(\/|$)/i.test(lower)) { return true; }
+
+        return false;
+    }
+
+    /**
+     * Redact common secret patterns inside any text that may be sent to the model.
+     * Used as a defence-in-depth measure even after secret files are filtered out —
+     * any source file might contain hard-coded keys.
+     */
+    private static redactSecrets(text: string): { text: string; redactionCount: number } {
+        let count = 0;
+        const replace = (input: string, regex: RegExp, replacement: string): string => {
+            return input.replace(regex, (...args) => { count++; return replacement; });
+        };
+
+        let out = text;
+        // KEY=VALUE pairs in .env / shell / TOML / INI / YAML where the key name looks sensitive
+        out = replace(out, /\b((?:[A-Z][A-Z0-9_]*_)?(?:API[_-]?KEY|SECRET(?:[_-]?KEY)?|PASSWORD|PASSWD|TOKEN|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|AUTH(?:[_-]?TOKEN)?|CLIENT[_-]?SECRET|BEARER))\s*[:=]\s*["']?[^"'\s,#\n\r]+["']?/gi, '$1=[REDACTED]');
+        // Bearer tokens
+        out = replace(out, /\bBearer\s+[A-Za-z0-9._\-+/=]{16,}/g, 'Bearer [REDACTED]');
+        // AWS access keys
+        out = replace(out, /\bAKIA[0-9A-Z]{16}\b/g, '[REDACTED_AWS_KEY]');
+        // GitHub PATs / fine-grained tokens
+        out = replace(out, /\bghp_[A-Za-z0-9]{20,}\b/g, '[REDACTED_GITHUB_PAT]');
+        out = replace(out, /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, '[REDACTED_GITHUB_PAT]');
+        // Boudica API keys
+        out = replace(out, /\bbdk_[A-Za-z0-9]{16,}\b/g, '[REDACTED_BOUDICA_KEY]');
+        // OpenAI keys
+        out = replace(out, /\bsk-[A-Za-z0-9]{20,}\b/g, '[REDACTED_OPENAI_KEY]');
+        // Slack tokens
+        out = replace(out, /\bxox[abprs]-[A-Za-z0-9\-]{10,}/g, '[REDACTED_SLACK_TOKEN]');
+        // JWTs (3 base64-url segments separated by dots, reasonably long)
+        out = replace(out, /\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b/g, '[REDACTED_JWT]');
+        // PEM-encoded private keys (multi-line)
+        out = replace(out, /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----/g, '[REDACTED_PRIVATE_KEY_BLOCK]');
+
+        return { text: out, redactionCount: count };
+    }
+
+    /**
+     * Build project context to feed to planning mode so the model can "see" the
+     * codebase. Strategy:
+     *   1. Scan workspace via projectScanner (uses cache; skips huge projects).
+     *   2. Build a tree-style file list (always included).
+     *   3. Detect filenames explicitly mentioned in the user's prompt and always
+     *      inline their full contents (these are the "files specifically asked
+     *      for by the user").
+     *   4. Fill remaining budget with contents of other source/config files,
+     *      smallest first, until the budget is exhausted.
+     *
+     * Secret-bearing files are NEVER inlined. All inlined content is passed
+     * through redactSecrets() as defence-in-depth.
+     *
+     * Returns undefined when the project is too large to scan or empty.
+     */
+    private async buildProjectContext(userMessage: string): Promise<string | undefined> {
+        const BUDGET_CHARS = 20000;          // tightened — server returned junk at 60k
+        const MAX_FILE_CHARS = 8000;         // per-file truncation cap
+
+        let structure;
+        try {
+            structure = await this.projectScanner.scanProject();
+        } catch (err) {
+            console.warn('[ProjectContext] Scan failed:', err);
+            return undefined;
+        }
+
+        const rawFiles = [
+            ...structure.sourceFiles,
+            ...structure.headerFiles,
+            ...structure.configFiles,
+            ...structure.buildFiles
+        ];
+
+        // Project too large to scan (scanner returned 0 files but totalFiles > 0)
+        if (rawFiles.length === 0) {
+            if (structure.totalFiles > 0) {
+                return `[Project has ${structure.totalFiles} files — too large for full inlining. Mention specific filenames in your prompt to include them.]`;
+            }
+            return undefined;
+        }
+
+        // Filter out any secret-bearing files BEFORE we look at their content
+        const allFiles = rawFiles.filter(f => {
+            if (ChatViewProvider.isSecretFile(f.relativePath)) {
+                console.log('[ProjectContext] Skipping secret-bearing file:', f.relativePath);
+                return false;
+            }
+            return true;
+        });
+
+        // 1) File tree (still lists secret files as a hint, but not their contents)
+        const treeLines = rawFiles
+            .map(f => ChatViewProvider.isSecretFile(f.relativePath)
+                ? `  • ${f.relativePath}  [secret — not inlined]`
+                : `  • ${f.relativePath}`)
+            .sort()
+            .join('\n');
+        const tree = `PROJECT FILE LIST (${rawFiles.length} files):\n${treeLines}`;
+
+        // 2) Detect user-mentioned filenames in the prompt (exclude secret files)
+        const mentioned = new Set<string>();
+        const promptLower = userMessage.toLowerCase();
+        for (const f of allFiles) {
+            const baseName = path.basename(f.relativePath).toLowerCase();
+            const rel = f.relativePath.toLowerCase();
+            if (promptLower.includes(rel) || promptLower.includes(baseName)) {
+                mentioned.add(f.relativePath);
+            }
+        }
+        if (mentioned.size > 0) {
+            console.log('[ProjectContext] User mentioned files:', Array.from(mentioned).join(', '));
+        }
+
+        // 3) Build content blocks
+        let used = tree.length;
+        let totalRedactions = 0;
+        const blocks: string[] = [tree];
+
+        const fmt = (f: typeof allFiles[number]): string => {
+            const truncated = f.content.length > MAX_FILE_CHARS
+                ? f.content.substring(0, MAX_FILE_CHARS) + `\n... [truncated ${f.content.length - MAX_FILE_CHARS} chars]`
+                : f.content;
+            const { text: safe, redactionCount } = ChatViewProvider.redactSecrets(truncated);
+            totalRedactions += redactionCount;
+            const note = redactionCount > 0 ? `, ${redactionCount} redaction(s)` : '';
+            return `--- FILE: ${f.relativePath} (${f.language}, ${f.size} bytes${note}) ---\n${safe}\n--- END FILE: ${f.relativePath} ---`;
+        };
+
+        // Inline mentioned files FIRST (always include, even if over budget — these
+        // were specifically requested by the user)
+        const mentionedFiles = allFiles.filter(f => mentioned.has(f.relativePath));
+        for (const f of mentionedFiles) {
+            const block = fmt(f);
+            blocks.push(block);
+            used += block.length;
+        }
+
+        // Fill remaining budget with other files, smallest first
+        const remaining = allFiles
+            .filter(f => !mentioned.has(f.relativePath))
+            .sort((a, b) => a.size - b.size);
+
+        let inlinedCount = mentionedFiles.length;
+        for (const f of remaining) {
+            if (used >= BUDGET_CHARS) { break; }
+            const block = fmt(f);
+            if (used + block.length > BUDGET_CHARS) {
+                const remainingBudget = BUDGET_CHARS - used - 200;
+                if (remainingBudget < 500) { continue; }
+                const tighter = f.content.substring(0, remainingBudget) + `\n... [truncated]`;
+                const { text: safe, redactionCount } = ChatViewProvider.redactSecrets(tighter);
+                totalRedactions += redactionCount;
+                const note = redactionCount > 0 ? `, ${redactionCount} redaction(s)` : '';
+                const tightBlock = `--- FILE: ${f.relativePath} (${f.language}, ${f.size} bytes${note}) ---\n${safe}\n--- END FILE: ${f.relativePath} ---`;
+                blocks.push(tightBlock);
+                used += tightBlock.length;
+                inlinedCount++;
+                continue;
+            }
+            blocks.push(block);
+            used += block.length;
+            inlinedCount++;
+        }
+
+        if (inlinedCount < allFiles.length) {
+            blocks.push(`\n[... ${allFiles.length - inlinedCount} additional file(s) not inlined due to context budget — file list above is complete.]`);
+        }
+
+        console.log(`[ProjectContext] Built context: ${inlinedCount}/${allFiles.length} files inlined, ${used} chars (budget ${BUDGET_CHARS}), ${mentionedFiles.length} explicitly mentioned, ${totalRedactions} secret(s) redacted, ${rawFiles.length - allFiles.length} secret file(s) skipped.`);
+        return blocks.join('\n\n');
+    }
+
+    /**
+     * Build a list of project files to upload as multipart attachments,
+     * plus a short text tree the model can read in the prompt.
+     *
+     * Use this instead of `buildProjectContext()` when the caller can attach
+     * files via `BoudicaClient.chatWithFiles(...)`. Sending the project as
+     * proper attachments stops the model from claiming "the source appears
+     * truncated" — each file arrives whole and is processed by the server's
+     * `TextExtractor` before the LLM ever sees the prompt.
+     *
+     * Filename encoding: the server sanitises uploaded filenames to
+     * `[A-Za-z0-9._\- ]`, so any `/` in a path would be stripped. We encode
+     * the path separator as `__` (e.g. `src/foo.ts` → `src__foo.ts`). The
+     * `tree` string explains this convention to the model.
+     *
+     * Secret-bearing files (`.env`, keys, …) are skipped entirely; remaining
+     * file contents are passed through `redactSecrets()` as defence-in-depth.
+     */
+    private async buildProjectFiles(userMessage: string): Promise<{
+        tree: string;
+        files: Array<{ relPath: string; filename: string; content: string }>;
+    } | undefined> {
+        // Generous per-attachment cap and overall payload cap — attachments live
+        // outside the prompt window, so the model doesn't have to read them
+        // linearly the way it does inlined context.
+        const MAX_FILE_BYTES = 200_000;          // ~200 KB per file
+        const TOTAL_PAYLOAD_BUDGET = 4_000_000;  // ~4 MB total upload
+
+        let structure;
+        try {
+            structure = await this.projectScanner.scanProject();
+        } catch (err) {
+            console.warn('[ProjectFiles] Scan failed:', err);
+            return undefined;
+        }
+
+        const rawFiles = [
+            ...structure.sourceFiles,
+            ...structure.headerFiles,
+            ...structure.configFiles,
+            ...structure.buildFiles
+        ];
+
+        if (rawFiles.length === 0) {
+            return undefined;
+        }
+
+        // Drop secret-bearing files BEFORE looking at contents
+        const allFiles = rawFiles.filter(f => {
+            if (ChatViewProvider.isSecretFile(f.relativePath)) {
+                console.log('[ProjectFiles] Skipping secret-bearing file:', f.relativePath);
+                return false;
+            }
+            return true;
+        });
+
+        // Tree (shown in prompt) — still lists secret files so the model knows
+        // they exist, but their contents are never uploaded.
+        const treeLines = rawFiles
+            .map(f => ChatViewProvider.isSecretFile(f.relativePath)
+                ? `  • ${f.relativePath}  [secret — not attached]`
+                : `  • ${f.relativePath}`)
+            .sort()
+            .join('\n');
+        const tree =
+            `PROJECT FILE LIST (${rawFiles.length} files total, ${allFiles.length} attached):\n` +
+            treeLines +
+            `\n\nNOTE: Attached file names use "__" in place of "/" (e.g. "src/foo.ts" is attached as "src__foo.ts").`;
+
+        // Detect user-mentioned filenames so they're attached first / never dropped
+        const mentioned = new Set<string>();
+        const promptLower = userMessage.toLowerCase();
+        for (const f of allFiles) {
+            const baseName = path.basename(f.relativePath).toLowerCase();
+            const rel = f.relativePath.toLowerCase();
+            if (promptLower.includes(rel) || promptLower.includes(baseName)) {
+                mentioned.add(f.relativePath);
+            }
+        }
+        if (mentioned.size > 0) {
+            console.log('[ProjectFiles] User mentioned files:', Array.from(mentioned).join(', '));
+        }
+
+        // Encode `relPath` into a server-safe filename (preserves path info via `__`)
+        const encodeFilename = (relPath: string): string => {
+            // Normalise separators, then replace `/` with `__`
+            const normalised = relPath.replace(/\\/g, '/');
+            const encoded = normalised.replace(/\//g, '__');
+            // Final scrub: keep only chars the server's sanitiser will preserve
+            return encoded.replace(/[^A-Za-z0-9._\- ]/g, '_');
+        };
+
+        const prepFile = (
+            f: typeof allFiles[number]
+        ): { relPath: string; filename: string; content: string; bytes: number } | null => {
+            const truncated = f.content.length > MAX_FILE_BYTES
+                ? f.content.substring(0, MAX_FILE_BYTES) +
+                  `\n\n... [truncated ${f.content.length - MAX_FILE_BYTES} bytes of ${f.content.length} total]`
+                : f.content;
+            const { text: safe, redactionCount } = ChatViewProvider.redactSecrets(truncated);
+            if (redactionCount > 0) {
+                console.log(`[ProjectFiles] Redacted ${redactionCount} secret(s) in ${f.relativePath}`);
+                reportStatus(`Redacted ${redactionCount} secret(s) in ${f.relativePath}`);
+            }
+            return {
+                relPath: f.relativePath,
+                filename: encodeFilename(f.relativePath),
+                content: safe,
+                bytes: Buffer.byteLength(safe, 'utf-8')
+            };
+        };
+
+        const files: Array<{ relPath: string; filename: string; content: string }> = [];
+        let totalBytes = 0;
+        let attachedCount = 0;
+        let droppedCount = 0;
+
+        // Mentioned files first (always attempted, but still subject to total budget)
+        const ordered = [
+            ...allFiles.filter(f => mentioned.has(f.relativePath)),
+            // Then everything else, smallest first so we fit as many as possible
+            ...allFiles
+                .filter(f => !mentioned.has(f.relativePath))
+                .sort((a, b) => a.size - b.size)
+        ];
+
+        for (const f of ordered) {
+            const prepped = prepFile(f);
+            if (!prepped) { continue; }
+            if (totalBytes + prepped.bytes > TOTAL_PAYLOAD_BUDGET) {
+                droppedCount++;
+                continue;
+            }
+            files.push({ relPath: prepped.relPath, filename: prepped.filename, content: prepped.content });
+            totalBytes += prepped.bytes;
+            attachedCount++;
+        }
+
+        const skippedSecrets = rawFiles.length - allFiles.length;
+        const summary =
+            `Prepared ${attachedCount}/${allFiles.length} attachments, ` +
+            `${(totalBytes / 1024).toFixed(1)} KB total ` +
+            `(budget ${(TOTAL_PAYLOAD_BUDGET / 1024).toFixed(0)} KB), ` +
+            `${mentioned.size} explicitly mentioned, ${droppedCount} dropped over budget, ` +
+            `${skippedSecrets} secret file(s) skipped.`;
+        console.log('[ProjectFiles] ' + summary);
+        reportStatus(summary);
+
+        if (files.length === 0) {
+            return undefined;
+        }
+
+        return { tree, files };
+    }
+
     private async handlePlanningMode(userMessage: string, fileContext?: string, fileName?: string) {
         const statusBarManager = getStatusBarManager();
         
@@ -784,22 +1164,75 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             
             const workspaceRoot = workspaceFolder.uri.fsPath;
             
-            // Generate plan
-            const plan = await generatePlan(this.client, userMessage, workspaceRoot);
+            // Build project files as multipart attachments (preferred path) so the
+            // model receives each file whole via the server's TextExtractor pipeline
+            // instead of seeing a truncated, inlined dump in the prompt body.
+            statusBarManager.showOperation('Planning', 'Scanning project for context...');
+            const projectFiles = await this.buildProjectFiles(userMessage);
+            if (projectFiles) {
+                const planMsg =
+                    `Planning mode: attaching ${projectFiles.files.length} project file(s) ` +
+                    `(${(projectFiles.files.reduce((n, f) => n + Buffer.byteLength(f.content, 'utf-8'), 0) / 1024).toFixed(1)} KB)`;
+                console.log('[Extension] ' + planMsg);
+                reportStatus(planMsg);
+            } else {
+                console.log('[Extension] Planning mode: no project files to attach (empty or too large)');
+                reportStatus('Planning mode: no project files to attach (empty or too large)');
+            }
+
+            // Generate plan — pass project files as attachments, not as inline text.
+            const plan = await generatePlan(
+                this.client,
+                userMessage,
+                workspaceRoot,
+                fileContext,
+                fileName,
+                undefined,        // legacy inline projectContext: no longer used
+                projectFiles      // new: multipart attachments + tree
+            );
             
             if (!plan || plan.steps.length === 0) {
                 this.view?.webview.postMessage({
                     command: 'setTyping',
                     typing: false
                 });
-                this.view?.webview.postMessage({
-                    command: 'addMessage',
-                    role: 'error',
-                    content: 'Failed to generate a plan. Please try rephrasing your request.'
-                });
+                if (plan && plan.projectType === 'intercepted') {
+                    const subs = plan.promptSubstitutions || [];
+                    const subsNote = subs.length > 0
+                        ? `\n\nWe already rewrote ${subs.length} trigger word(s) before sending (${subs.map(s => `*"${s.from}" → "${s.to}"*`).join(', ')}) but the server still intercepted the request.`
+                        : '';
+                    this.view?.webview.postMessage({
+                        command: 'addMessage',
+                        role: 'error',
+                        content: `⚠️ The Boudica server intercepted this prompt as an **API connection provisioning** request instead of generating a build plan.${subsNote}\n\n**Try rephrasing without trigger words.** Avoid combinations of: *web*, *connection*, *oauth*, *api*, *endpoint*, *provision*.\n\nExamples that work:\n• *"Scaffold a Python Flask project with a browser-based chat page that supports user login"*\n• *"Generate source files for a single-page chat app written in Python (Flask) + HTML/JS, including login"*`
+                    });
+                } else if (plan && plan.projectType === 'safety-filtered') {
+                    this.view?.webview.postMessage({
+                        command: 'addMessage',
+                        role: 'error',
+                        content: `⚠️ The Boudica server's **safety filter** rejected this prompt as potentially malicious. This usually means the wording overlapped with patterns used by jailbreak/injection attacks — it's not a judgement of your intent.\n\n**Try rephrasing in plainer terms.** Helpful tips:\n• Avoid imperative chains like *"do not"*, *"you must not"*, *"if you …, then …"*.\n• Avoid lists of forbidden tokens / code fragments.\n• Describe the outcome you want, not what the model should refuse to do.\n\nExamples that work:\n• *"Scaffold a Python Flask project with a browser-based chat page and a login flow"*\n• *"Plan the files for a single-page chat app written in Python (Flask) and HTML/JS, including user login"*`
+                    });
+                } else {
+                    this.view?.webview.postMessage({
+                        command: 'addMessage',
+                        role: 'error',
+                        content: 'Could not parse a structured plan (no recognizable filenames in the steps). Try rephrasing — for example, mention an output filename like `app.py`, `index.html`, or `package.json`.'
+                    });
+                }
                 return;
             }
             
+            // If we rewrote any trigger words, let the user know
+            const subs = plan.promptSubstitutions || [];
+            if (subs.length > 0) {
+                const subList = subs.map(s => `  • *"${s.from}"* → *"${s.to}"*`).join('\n');
+                this.view?.webview.postMessage({
+                    command: 'addMessage',
+                    role: 'assistant',
+                    content: `ℹ️ I rewrote ${subs.length} word(s) in your request to avoid the server's API-connection interceptor:\n${subList}`
+                });
+            }
+
             // Show plan to user
             const planMessage = this.formatPlan(plan);
             this.view?.webview.postMessage({
@@ -824,13 +1257,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 (step, total, message) => {
                     // Update status bar with progress
                     statusBarManager.showOperation('Creating', `${message} (${step}/${total})`);
-                    
-                    // Send progress update to chat UI
-                    this.view?.webview.postMessage({
-                        command: 'addMessage',
-                        role: 'assistant',
-                        content: `⏳ ${message} (${step}/${total})`
-                    });
+
+                    // Stream a single-line status trace into the chat instead of
+                    // posting a new assistant bubble for every file.
+                    reportStatus(`${message} (${step}/${total})`);
                 },
                 fileContext,  // Pass reference file content (e.g., slm_cgi_client.cpp)
                 fileName      // Pass reference file name
@@ -842,7 +1272,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             // Show completion message
             if (result.success && result.filesCreated.length > 0) {
                 const fileList = result.filesCreated.map(f => `  • ${f}`).join('\n');
-                const completionMessage = `✅ **Project created successfully!**\n\nCreated ${result.filesCreated.length} files:\n${fileList}\n\n🚀 Your project is ready to build!`;
+                let completionMessage = `✅ **Project created successfully!**\n\nCreated ${result.filesCreated.length} files:\n${fileList}\n\n🚀 Your project is ready to build!`;
+
+                // If any per-file generations were blocked by the server's
+                // connection-provisioning interceptor, warn the user so they
+                // know those files were skipped (rather than written with the
+                // interceptor's config dump).
+                if (result.interceptedFiles && result.interceptedFiles.length > 0) {
+                    const blocked = result.interceptedFiles.map(f => `  • ${f}`).join('\n');
+                    completionMessage += `\n\n⚠️ **${result.interceptedFiles.length} file(s) were skipped** — the Boudica server's API-connection interceptor returned a config dump for them instead of code:\n${blocked}\n\nTry rephrasing the original request to avoid the trigger words *web*, *oauth*, *api*, *connection*, *endpoint*.`;
+                }
                 
                 if (this.view) {
                     // Webview is open - show message immediately
@@ -1921,6 +2360,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private async getActiveFileContext(): Promise<string | undefined> {
         const editor = vscode.window.activeTextEditor;
         console.log('[Extension] getActiveFileContext - editor:', editor ? 'found' : 'not found');
+        reportStatus('getActiveFileContext - editor: ' + (editor ? 'found' : 'not found'));
         if (!editor) {
             return undefined;
         }
@@ -1931,6 +2371,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const languageId = document.languageId;
         console.log('[Extension] Active file:', fileName, 'Language:', languageId);
 
+        // SECURITY: refuse to send secret-bearing files as context
+        if (ChatViewProvider.isSecretFile(fileName) || ChatViewProvider.isSecretFile(fullPath)) {
+            console.warn('[Extension] Active file looks like a secret file; NOT sending its contents.');
+            vscode.window.showWarningMessage(
+                `BoudiCode: Active file "${fileName}" looks like a secret/credentials file. Its contents will NOT be sent to the model.`
+            );
+            // Send only a placeholder so the model knows there's an active file,
+            // but no contents leave the machine.
+            return `File: ${fileName}\nPath: ${fullPath}\nLanguage: ${languageId}\n\n[Contents withheld — this file appears to contain secrets/credentials and was not transmitted.]`;
+        }
+
         // Get full file content
         const fileContent = document.getText();
         console.log('[Extension] File content length:', fileContent.length);
@@ -1940,7 +2391,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const truncated = fileContent.length > maxSize;
         const content = truncated ? fileContent.substring(0, maxSize) + '\n\n... (truncated)' : fileContent;
 
-        const contextString = `File: ${fileName}\nPath: ${fullPath}\nLanguage: ${languageId}\nLines: ${document.lineCount}\n\n\`\`\`${languageId}\n${content}\n\`\`\``;
+        // Defence-in-depth: redact any inline secrets even for non-secret files
+        const { text: safeContent, redactionCount } = ChatViewProvider.redactSecrets(content);
+        if (redactionCount > 0) {
+            console.warn(`[Extension] Redacted ${redactionCount} potential secret(s) from active file before sending.`);
+        }
+
+        const contextString = `File: ${fileName}\nPath: ${fullPath}\nLanguage: ${languageId}\nLines: ${document.lineCount}\n\n\`\`\`${languageId}\n${safeContent}\n\`\`\``;
         console.log('[Extension] Prepared context length:', contextString.length);
         return contextString;
     }
@@ -2104,6 +2561,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         #typing-indicator.active {
             display: block;
+        }
+
+        /* Streaming status lines (Boudica progress trace) */
+        .status-line {
+            display: block;
+            padding: 2px 12px;
+            margin: 0;
+            font-family: var(--vscode-editor-font-family, monospace);
+            font-size: 11px;
+            color: var(--vscode-descriptionForeground, #888);
+            opacity: 0.85;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .status-line .status-prefix {
+            color: var(--vscode-textLink-foreground, #4ea1ff);
+            margin-right: 6px;
+            font-weight: 600;
         }
 
         #input-container {
@@ -2364,6 +2839,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'addMessage':
                     addMessage(message.role, message.content, message.tokensPerSecond);
                     break;
+                case 'addStatus':
+                    addStatus(message.text);
+                    break;
                 case 'startStreamMessage':
                     startStreamMessage(message.id);
                     break;
@@ -2401,6 +2879,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         // Streaming helpers
         const streamingMessages = {};
+
+        // Append a one-line "Boudica" progress trace into the chat,
+        // styled like a console log so the user can see what the
+        // extension is doing while a long task runs.
+        function addStatus(text) {
+            const welcomeEl = document.getElementById('welcome');
+            if (welcomeEl) { welcomeEl.remove(); }
+
+            const line = document.createElement('div');
+            line.className = 'status-line';
+
+            const prefix = document.createElement('span');
+            prefix.className = 'status-prefix';
+            prefix.textContent = 'Boudica';
+
+            const body = document.createElement('span');
+            body.className = 'status-body';
+            body.textContent = String(text == null ? '' : text);
+
+            line.appendChild(prefix);
+            line.appendChild(body);
+            messagesDiv.appendChild(line);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
 
         function startStreamMessage(id) {
             const welcomeEl = document.getElementById('welcome');

@@ -7,6 +7,7 @@ import axios, { AxiosInstance, AxiosResponse } from 'axios';
 import * as vscode from 'vscode';
 import FormData = require('form-data');
 import * as fs from 'fs';
+import { reportStatus } from './statusReporter';
 
 export interface BoudicaConfig {
     apiEndpoint: string;
@@ -31,6 +32,7 @@ export interface ChatRequest {
     request_domain?: string;
     forCodeGeneration?: boolean;  // Add code generation directives to prompt
     skipClean?: boolean;          // Skip cleanResponse (use for structured responses like fix plans)
+    rawMessage?: boolean;         // Bypass prepareMessage entirely — send `message` verbatim
 }
 
 export interface ChatResponse {
@@ -80,7 +82,10 @@ export class BoudicaClient {
      * Prepend directives to control Boudica's output format
      * EXACT format that works in web UI
      */
-    private prepareMessage(message: string, forCodeGeneration: boolean = false): string {
+    private prepareMessage(message: string, forCodeGeneration: boolean = false, rawMessage: boolean = false): string {
+        if (rawMessage) {
+            return message;
+        }
         if (forCodeGeneration) {
             return `FORMAT: EXECUTABLE_SOURCE_CODE
 
@@ -108,8 +113,20 @@ No Memory\n${message}`;
         // Remove markdown code fences at the start (```cpp, ```javascript, etc.)
         cleaned = cleaned.replace(/^```[\w]*\s*\n/gm, '');
         
-        // Remove closing markdown code fence and footer (```\n---\n[disclaimer])
-        cleaned = cleaned.replace(/\n```\s*(?:\n---)?[\s\S]*$/g, '');
+        // Remove closing markdown code fence and ONLY the trailing boilerplate/disclaimer after it.
+        // Use the LAST occurrence of a closing fence so multi-block responses are preserved.
+        // Strategy: find last \n``` boundary; only strip if remainder looks like a footer/disclaimer.
+        const lastFenceIdx = cleaned.lastIndexOf('\n```');
+        if (lastFenceIdx !== -1) {
+            const afterFence = cleaned.slice(lastFenceIdx + 4); // text after the closing fence
+            // Strip only if nothing meaningful follows (empty, ---, or boilerplate)
+            if (afterFence.trim().length === 0 ||
+                /^\s*---/.test(afterFence) ||
+                /created with boudica/i.test(afterFence) ||
+                /your feedback helps/i.test(afterFence)) {
+                cleaned = cleaned.slice(0, lastFenceIdx);
+            }
+        }
         
         // Remove HTML comments (<!-- comment -->)
         cleaned = cleaned.replace(/<!--[\s\S]*?-->/g, '');
@@ -184,11 +201,11 @@ No Memory\n${message}`;
             console.log('BoudicaClient: API Key configured:', this.config.apiKey ? 'Yes' : 'No');
             
             // Prepend "No Memory" to disable inference memory (and code directives if requested)
-            const preparedMessage = this.prepareMessage(request.message, request.forCodeGeneration || false);
+            const preparedMessage = this.prepareMessage(request.message, request.forCodeGeneration || false, request.rawMessage || false);
             
             // Code generation uses server context limit: 32k
             const effectiveMaxTokens = request.max_tokens ?? 
-                                      (request.forCodeGeneration ? 32000 : (this.config.maxTokens ?? 2000));
+                                      (this.config.maxTokens ?? 32000);
             
             // If file content provided, send as FormData with file attachment
             if (request.file_content && request.file_name) {
@@ -315,37 +332,85 @@ No Memory\n${message}`;
     }
 
     /**
-     * Send a chat message with file attachments
+     * Send a chat message with one or more file attachments via multipart/form-data.
+     *
+     * Each attachment may be either:
+     *   • a path on disk (`path` set), which is streamed from the filesystem, or
+     *   • in-memory content (`content` set as string or Buffer), which is uploaded
+     *     directly without touching disk. Use this for content that has already
+     *     been read + redacted (e.g. project source with secrets stripped).
+     *
+     * The server (`slm_cgi_handlers.cpp` → `parse_multipart`) keys files by the
+     * `filename="..."` attribute on each part — the form field name itself
+     * (`document_0`, `document_1`, …) is informational only. The server then
+     * runs `TextExtractor::extract_from_file` on each upload and concatenates the
+     * result into `document_context` as:
+     *     Reference material from <filename>:
+     *
+     *     <contents>
+     *
+     * NOTE: The server sanitises filenames to `[A-Za-z0-9._\- ]` before saving
+     * to `/tmp/boudica_uploads/`, so any `/` in a path will be stripped. Callers
+     * that need to preserve a relative path should encode separators (e.g. `__`
+     * for `/`) into the supplied `filename`.
      */
-    async chatWithFiles(request: ChatRequest, files: { path: string; filename: string }[]): Promise<ChatResponse> {
+    async chatWithFiles(
+        request: ChatRequest,
+        files: Array<{ filename: string; path?: string; content?: string | Buffer }>
+    ): Promise<ChatResponse> {
         try {
             // Prepend "No Memory" to disable inference memory (and code directives if requested)
-            const preparedMessage = this.prepareMessage(request.message, request.forCodeGeneration || false);
-            
+            const preparedMessage = this.prepareMessage(request.message, request.forCodeGeneration || false, request.rawMessage || false);
+
             const formData = new FormData();
-            
-            // Add text fields
+
+            // Add text fields (mirror the regular `chat()` JSON payload shape)
             formData.append('message', preparedMessage);
             formData.append('session_id', request.session_id || 'vscode-extension');
             formData.append('user_id', request.user_id || this.config.userId || 'vscode-user');
             formData.append('temperature', String(request.temperature ?? this.config.temperature ?? 0.8));
-            formData.append('max_tokens', String(request.max_tokens ?? this.config.maxTokens ?? 2000));
+            formData.append('max_tokens', String(request.max_tokens ?? this.config.maxTokens ?? 32000));
+            // CRITICAL: use_rag must be TRUE to disable list-guard (12-item truncation)
             formData.append('use_rag', String(request.use_rag ?? this.config.useRag ?? true));
             formData.append('stream', String(request.stream ?? false));
 
             if (request.lora_adapter) {
                 formData.append('lora_adapter', request.lora_adapter);
             }
-
-            // Add files
-            for (const file of files) {
-                if (fs.existsSync(file.path)) {
-                    formData.append('files', fs.createReadStream(file.path), {
-                        filename: file.filename,
-                        contentType: 'application/octet-stream'
-                    });
-                }
+            if (request.request_domain) {
+                formData.append('request_domain', request.request_domain);
             }
+
+            // Add attachments. Use indexed field names to match the
+            // `document_N` / `filename_N` convention used by the single-file
+            // `chat()` path and the browser UI, even though the server only
+            // looks at the `filename=` attribute.
+            let attachedCount = 0;
+            files.forEach((file, idx) => {
+                let payload: Buffer | NodeJS.ReadableStream | undefined;
+
+                if (file.content !== undefined) {
+                    payload = Buffer.isBuffer(file.content)
+                        ? file.content
+                        : Buffer.from(file.content, 'utf-8');
+                } else if (file.path && fs.existsSync(file.path)) {
+                    payload = fs.createReadStream(file.path);
+                } else {
+                    console.warn('[BoudicaClient] chatWithFiles: skipping file (no content or readable path):', file.filename);
+                    return;
+                }
+
+                formData.append(`document_${idx}`, payload, {
+                    filename: file.filename,
+                    contentType: 'text/plain'
+                });
+                formData.append(`filename_${idx}`, file.filename);
+                attachedCount++;
+            });
+            formData.append('document_count', String(attachedCount));
+
+            console.log(`[BoudicaClient] chatWithFiles: posting ${attachedCount} attachment(s), message length ${preparedMessage.length}`);
+            reportStatus(`chatWithFiles: posting ${attachedCount} attachment(s), message length ${preparedMessage.length}`);
 
             const response: AxiosResponse<ChatResponse> = await this.client.post('/chat', formData, {
                 headers: {
@@ -356,15 +421,21 @@ No Memory\n${message}`;
                 maxBodyLength: Infinity
             });
 
-            // Clean response before returning
+            // Honour the same skipClean/forCodeGeneration semantics as `chat()`
+            if (request.forCodeGeneration || request.skipClean) {
+                return response.data;
+            }
             if (response.data.response) {
                 response.data.response = this.cleanResponse(response.data.response);
             }
             return response.data;
         } catch (error: any) {
-            console.error('Boudica chat with files error:', error);
+            console.error('Boudica chat with files error:', error?.message || error);
+            if (error?.response) {
+                console.error('  status:', error.response.status, 'data:', error.response.data);
+            }
             return {
-                error: error.response?.data?.error || error.message || 'Failed to upload files to Boudica'
+                error: error?.response?.data?.error || error?.message || 'Failed to upload files to Boudica'
             };
         }
     }
@@ -379,9 +450,9 @@ No Memory\n${message}`;
         onChunk: (text: string) => void,
         signal?: AbortSignal
     ): Promise<ChatResponse> {
-        const preparedMessage = this.prepareMessage(request.message, request.forCodeGeneration || false);
+        const preparedMessage = this.prepareMessage(request.message, request.forCodeGeneration || false, request.rawMessage || false);
         const effectiveMaxTokens = request.max_tokens ??
-            (request.forCodeGeneration ? 32000 : (this.config.maxTokens ?? 2000));
+            (this.config.maxTokens ?? 32000);
 
         const payload = {
             message: preparedMessage,
@@ -477,7 +548,7 @@ No Memory\n${message}`;
             const payload = {
                 prompt: preparedMessage,
                 temperature: request.temperature ?? this.config.temperature ?? 0.8,
-                max_tokens: request.max_tokens ?? this.config.maxTokens ?? 2000
+                max_tokens: request.max_tokens ?? this.config.maxTokens ?? 32000
             };
 
             const response: AxiosResponse<ChatResponse> = await this.client.post('/generate', payload);
@@ -556,6 +627,6 @@ export function getBoudicaClient(): BoudicaClient {
         userId: config.get('userId', ''),
         useRag: config.get('useRag', true),
         temperature: config.get('temperature', 0.8),
-        maxTokens: config.get('maxTokens', 2000)
+        maxTokens: config.get('maxTokens', 32000)
     });
 }
