@@ -11,6 +11,7 @@ export class StatusBarManager {
     private quickAccessItem: vscode.StatusBarItem;
     private isConnected: boolean = false;
     private currentOperation: string | null = null;
+    private pendingTimeouts: Set<ReturnType<typeof setTimeout>> = new Set();
 
     constructor() {
         // Connection status (left side)
@@ -113,7 +114,8 @@ export class StatusBarManager {
         this.operationStatusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.prominentBackground');
         this.operationStatusItem.show();
         
-        setTimeout(() => {
+        const tid = setTimeout(() => {
+            this.pendingTimeouts.delete(tid);
             if (this.currentOperation) {
                 this.operationStatusItem.text = previousText;
                 this.operationStatusItem.tooltip = previousTooltip;
@@ -123,6 +125,7 @@ export class StatusBarManager {
             this.operationStatusItem.color = undefined;
             this.operationStatusItem.backgroundColor = undefined;
         }, duration);
+        this.pendingTimeouts.add(tid);
     }
 
     /**
@@ -138,7 +141,8 @@ export class StatusBarManager {
         this.operationStatusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
         this.operationStatusItem.show();
         
-        setTimeout(() => {
+        const tid = setTimeout(() => {
+            this.pendingTimeouts.delete(tid);
             if (this.currentOperation) {
                 this.operationStatusItem.text = previousText;
                 this.operationStatusItem.tooltip = previousTooltip;
@@ -148,6 +152,7 @@ export class StatusBarManager {
             this.operationStatusItem.color = undefined;
             this.operationStatusItem.backgroundColor = undefined;
         }, duration);
+        this.pendingTimeouts.add(tid);
     }
 
     /**
@@ -182,6 +187,8 @@ export class StatusBarManager {
      * Dispose all status bar items
      */
     dispose() {
+        this.pendingTimeouts.forEach(tid => clearTimeout(tid));
+        this.pendingTimeouts.clear();
         this.connectionStatusItem.dispose();
         this.operationStatusItem.dispose();
         this.quickAccessItem.dispose();

@@ -186,10 +186,11 @@ export class CodeSearch {
                 // Search each file for keywords
                 for (const fileUri of files) {
                     try {
-                        const document = await vscode.workspace.openTextDocument(fileUri);
-                        const content = document.getText();
+                        // Use fs.readFile instead of openTextDocument to avoid polluting the document cache
+                        const rawBytes = await vscode.workspace.fs.readFile(fileUri);
+                        const content = Buffer.from(rawBytes).toString('utf8');
                         const lines = content.split('\n');
-                        
+
                         // Skip files larger than 100KB
                         if (content.length > 100000) {
                             continue;
@@ -304,9 +305,10 @@ export class CodeSearch {
 
         for (const result of topFiles) {
             try {
-                const document = await vscode.workspace.openTextDocument(result.file);
-                const content = document.getText();
-                
+                const uri = vscode.Uri.file(result.file);
+                const rawBytes = await vscode.workspace.fs.readFile(uri);
+                const content = Buffer.from(rawBytes).toString('utf8');
+
                 // Only include reasonably sized files (< 100KB)
                 if (content.length < 100000) {
                     fileContents.set(result.relativePath, content);

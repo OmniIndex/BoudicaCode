@@ -14,6 +14,9 @@ export enum BuildSystem {
     NPM = 'npm',
     CARGO = 'cargo',
     GO = 'go',
+    PYTHON = 'python',
+    MAVEN = 'maven',
+    GRADLE = 'gradle',
     UNKNOWN = 'unknown'
 }
 
@@ -124,6 +127,69 @@ export class BuildRunner {
                 workingDirectory: this.workspaceRoot
             };
         }
+
+        // Check for pyproject.toml or setup.py (Python)
+        const pyprojectFile = path.join(this.workspaceRoot, 'pyproject.toml');
+        const setupPy = path.join(this.workspaceRoot, 'setup.py');
+        if (fs.existsSync(pyprojectFile)) {
+            console.log('[BuildRunner] Detected Python project (pyproject.toml)');
+            return {
+                system: BuildSystem.PYTHON,
+                buildCommand: `python -m build`,
+                workingDirectory: this.workspaceRoot
+            };
+        }
+        if (fs.existsSync(setupPy)) {
+            console.log('[BuildRunner] Detected Python project (setup.py)');
+            return {
+                system: BuildSystem.PYTHON,
+                buildCommand: `python setup.py build`,
+                workingDirectory: this.workspaceRoot
+            };
+        }
+
+        // Check for pom.xml (Maven)
+        const pomFile = path.join(this.workspaceRoot, 'pom.xml');
+        if (fs.existsSync(pomFile)) {
+            console.log('[BuildRunner] Detected Maven project');
+            return {
+                system: BuildSystem.MAVEN,
+                buildCommand: `mvn compile`,
+                workingDirectory: this.workspaceRoot
+            };
+        }
+
+        // Check for build.gradle or build.gradle.kts (Gradle)
+        const gradleFile = path.join(this.workspaceRoot, 'build.gradle');
+        const gradleKts = path.join(this.workspaceRoot, 'build.gradle.kts');
+        if (fs.existsSync(gradleFile) || fs.existsSync(gradleKts)) {
+            console.log('[BuildRunner] Detected Gradle project');
+            const gradlew = path.join(this.workspaceRoot, 'gradlew');
+            const useWrapper = fs.existsSync(gradlew);
+            return {
+                system: BuildSystem.GRADLE,
+                buildCommand: useWrapper ? `./gradlew build` : `gradle build`,
+                workingDirectory: this.workspaceRoot
+            };
+        }
+
+        // Fallback: any .py files in the workspace root or a src/ subdirectory
+        // Use python -m compileall for syntax checking
+        const hasPyInRoot = fs.existsSync(this.workspaceRoot) &&
+            fs.readdirSync(this.workspaceRoot).some(f => f.endsWith('.py'));
+        const srcDir = path.join(this.workspaceRoot, 'src');
+        const hasPyInSrc = fs.existsSync(srcDir) && fs.statSync(srcDir).isDirectory() &&
+            fs.readdirSync(srcDir).some(f => f.endsWith('.py'));
+
+        if (hasPyInRoot || hasPyInSrc) {
+            console.log('[BuildRunner] Detected Python scripts — using compileall syntax check');
+            // -q suppresses "Compiling..." lines; stderr is merged with stdout via 2>&1
+            return {
+                system: BuildSystem.PYTHON,
+                buildCommand: 'python3 -m compileall -q . 2>&1',
+                workingDirectory: this.workspaceRoot
+            };
+        }
         
         console.log('[BuildRunner] No build system detected');
         return undefined;
@@ -141,11 +207,12 @@ export class BuildRunner {
             if (!config) {
                 config = await this.detectBuildSystem();
                 if (!config) {
+                    const noSysMsg = 'No build system detected. Supported: CMake, Make, npm, Cargo, Go, Python (py/pyproject.toml/setup.py), Maven, Gradle.';
                     return {
                         success: false,
                         buildSystem: BuildSystem.UNKNOWN,
-                        output: '',
-                        errors: ['No build system detected. Please add CMakeLists.txt, Makefile, package.json, Cargo.toml, or go.mod.'],
+                        output: noSysMsg,
+                        errors: [noSysMsg],
                         duration: 0
                     };
                 }
@@ -195,16 +262,16 @@ export class BuildRunner {
             
             console.log(`[BuildRunner] Executing in ${config.workingDirectory}: ${config.buildCommand}`);
             
-            const process = exec(
+            const child = exec(
                 config.buildCommand,
                 {
                     cwd: config.workingDirectory,
                     maxBuffer: 10 * 1024 * 1024, // 10MB buffer
                     shell: '/bin/bash'
                 },
-                (error: any, stdout: string, stderr: string) => {
+                (err: any, stdout: string, stderr: string) => {
                     const output = stdout + '\n' + stderr;
-                    const success = !error || error.code === 0;
+                    const success = !err || err.code === 0;
                     
                     console.log(`[BuildRunner] Build ${success ? 'succeeded' : 'failed'}`);
                     console.log(`[BuildRunner] Output length: ${output.length} chars`);
@@ -217,10 +284,11 @@ export class BuildRunner {
                         success,
                         output,
                         errors: success ? [] : [output],
-                        exitCode: error?.code
+                        exitCode: err?.code
                     });
                 }
             );
+            void child;
         });
     }
 
@@ -261,9 +329,18 @@ export class BuildRunner {
         
         switch (config.system) {
             case BuildSystem.CMAKE:
-                cleanCommand = config.buildDir 
-                    ? `rm -rf ${config.buildDir}/*`
-                    : `rm -rf build/*`;
+                // Security: validate buildDir stays inside workspaceRoot before using in shell
+                if (config.buildDir) {
+                    const resolvedBuildDir = path.resolve(config.buildDir);
+                    const resolvedWorkspace = path.resolve(this.workspaceRoot);
+                    if (!resolvedBuildDir.startsWith(resolvedWorkspace + path.sep) && resolvedBuildDir !== resolvedWorkspace) {
+                        vscode.window.showErrorMessage('BoudiCode: Build directory is outside workspace — clean aborted.');
+                        return;
+                    }
+                    cleanCommand = `rm -rf "${config.buildDir}/"*`;
+                } else {
+                    cleanCommand = `rm -rf build/*`;
+                }
                 break;
             case BuildSystem.MAKE:
                 cleanCommand = `make clean`;
@@ -276,6 +353,15 @@ export class BuildRunner {
                 break;
             case BuildSystem.GO:
                 cleanCommand = `go clean`;
+                break;
+            case BuildSystem.PYTHON:
+                cleanCommand = `find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null; find . -name "*.pyc" -delete 2>/dev/null; true`;
+                break;
+            case BuildSystem.MAVEN:
+                cleanCommand = `mvn clean`;
+                break;
+            case BuildSystem.GRADLE:
+                cleanCommand = fs.existsSync(path.join(this.workspaceRoot, 'gradlew')) ? `./gradlew clean` : `gradle clean`;
                 break;
             default:
                 return;

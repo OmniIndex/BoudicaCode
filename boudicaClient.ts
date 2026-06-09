@@ -30,6 +30,7 @@ export interface ChatRequest {
     lora_adapter?: string;
     request_domain?: string;
     forCodeGeneration?: boolean;  // Add code generation directives to prompt
+    skipClean?: boolean;          // Skip cleanResponse (use for structured responses like fix plans)
 }
 
 export interface ChatResponse {
@@ -89,9 +90,9 @@ CRITICAL: Output pure executable source code only.
 - Include necessary imports/headers exactly as: #include <header>
 - Code blocks in triple backticks are acceptable if content is runnable
 
-No Memory ${message}`;
+No Memory\n${message}`;
         } else {
-            return `No Memory. No Rag ${message}`;
+            return `No Memory\n${message}`;
         }
     }
 
@@ -113,9 +114,10 @@ No Memory ${message}`;
         // Remove HTML comments (<!-- comment -->)
         cleaned = cleaned.replace(/<!--[\s\S]*?-->/g, '');
         
-        // Remove Doxygen-style documentation comments (/** @brief ... */)
-        // Match /** followed by anything including @tags, then */
-        cleaned = cleaned.replace(/\/\*\*[\s\S]*?\*\//g, '');
+        // Remove Doxygen-style boilerplate ONLY if it looks like AI-generated scaffolding
+        // (starts at column 0 and only contains @-tags / brief text, no real code)
+        // We do NOT strip /** ... */ that are part of real source code.
+        cleaned = cleaned.replace(/^\s*\/\*\*\s*\n(?:\s*\*\s*@[a-z]+[^\n]*\n)*\s*\*\//gm, '');
         
         // Remove HTML/XML style tags and their content (often used for code display styling)
         cleaned = cleaned.replace(/<style[\s\S]*?<\/style>/gi, '');
@@ -231,8 +233,8 @@ No Memory ${message}`;
                 }
                 
                 // CRITICAL: Do NOT clean code generation responses - cleanResponse destroys code!
-                // For code generation, return raw response from server
-                if (request.forCodeGeneration) {
+                // For code generation or structured responses (fix plans), return raw response from server
+                if (request.forCodeGeneration || request.skipClean) {
                     return response.data;
                 }
                 
@@ -281,8 +283,8 @@ No Memory ${message}`;
                 }
                 
                 // CRITICAL: Do NOT clean code generation responses - cleanResponse destroys code!
-                // For code generation, return raw response from server
-                if (request.forCodeGeneration) {
+                // For code generation or structured responses (fix plans), return raw response from server
+                if (request.forCodeGeneration || request.skipClean) {
                     return response.data;
                 }
                 
@@ -348,7 +350,7 @@ No Memory ${message}`;
             const response: AxiosResponse<ChatResponse> = await this.client.post('/chat', formData, {
                 headers: {
                     ...formData.getHeaders(),
-                    ...(this.config.apiKey && { 'X-API-Key': this.config.apiKey })
+                    ...(this.config.apiKey && { 'Authorization': `Bearer ${this.config.apiKey}` })
                 },
                 maxContentLength: Infinity,
                 maxBodyLength: Infinity
@@ -364,6 +366,103 @@ No Memory ${message}`;
             return {
                 error: error.response?.data?.error || error.message || 'Failed to upload files to Boudica'
             };
+        }
+    }
+
+    /**
+     * Stream a chat response from Boudica, calling onChunk for each received token.
+     * The server must support SSE (stream: true). Falls back to regular chat if the
+     * server returns a non-streaming response or streaming is unsupported.
+     */
+    async chatStream(
+        request: ChatRequest,
+        onChunk: (text: string) => void,
+        signal?: AbortSignal
+    ): Promise<ChatResponse> {
+        const preparedMessage = this.prepareMessage(request.message, request.forCodeGeneration || false);
+        const effectiveMaxTokens = request.max_tokens ??
+            (request.forCodeGeneration ? 32000 : (this.config.maxTokens ?? 2000));
+
+        const payload = {
+            message: preparedMessage,
+            session_id: request.session_id || 'vscode-extension',
+            user_id: request.user_id || this.config.userId || 'vscode-user',
+            temperature: request.temperature ?? this.config.temperature ?? 0.8,
+            max_tokens: effectiveMaxTokens,
+            use_rag: request.use_rag ?? this.config.useRag ?? true,
+            stream: true,
+            ...(request.lora_adapter && { lora_adapter: request.lora_adapter }),
+            ...(request.request_domain && { request_domain: request.request_domain })
+        };
+
+        try {
+            const axiosConfig: any = { responseType: 'stream' };
+            if (signal) {
+                axiosConfig.signal = signal;
+            }
+
+            const response = await this.client.post('/chat', payload, axiosConfig);
+            const stream = response.data as NodeJS.ReadableStream;
+
+            let fullText = '';
+            let sessionId = '';
+            let tokensPerSecond: number | undefined;
+            let buffer = '';
+
+            return new Promise((resolve, reject) => {
+                stream.on('data', (chunk: Buffer) => {
+                    buffer += chunk.toString('utf8');
+                    // SSE lines are separated by double-newline: 'data: {...}\n\n'
+                    const parts = buffer.split('\n\n');
+                    buffer = parts.pop() ?? '';
+                    for (const part of parts) {
+                        const line = part.replace(/^data:\s*/m, '').trim();
+                        if (!line || line === '[DONE]') { continue; }
+                        try {
+                            const parsed = JSON.parse(line);
+                            const token: string = parsed.token ?? parsed.text ?? parsed.response ?? '';
+                            if (token) { fullText += token; onChunk(token); }
+                            if (parsed.session_id) { sessionId = parsed.session_id; }
+                            if (parsed.tokens_per_second) { tokensPerSecond = parsed.tokens_per_second; }
+                        } catch {
+                            // Non-JSON chunk — treat as raw text
+                            if (line.length > 0) { fullText += line; onChunk(line); }
+                        }
+                    }
+                });
+
+                stream.on('end', () => {
+                    if (buffer.trim() && buffer.trim() !== '[DONE]') {
+                        try {
+                            const parsed = JSON.parse(buffer.replace(/^data:\s*/m, '').trim());
+                            const token: string = parsed.token ?? parsed.text ?? parsed.response ?? '';
+                            if (token) { fullText += token; onChunk(token); }
+                        } catch { /* ignore partial buffer */ }
+                    }
+                    const shouldClean = !request.forCodeGeneration && !request.skipClean;
+                    resolve({
+                        response: shouldClean ? this.cleanResponse(fullText) : fullText,
+                        session_id: sessionId || undefined,
+                        tokens_per_second: tokensPerSecond
+                    });
+                });
+
+                stream.on('error', (err: Error) => {
+                    if (fullText.length > 0) {
+                        const shouldClean = !request.forCodeGeneration && !request.skipClean;
+                        resolve({ response: shouldClean ? this.cleanResponse(fullText) : fullText, session_id: sessionId || undefined });
+                    } else {
+                        reject(err);
+                    }
+                });
+            });
+        } catch (error: any) {
+            if (error.name === 'AbortError' || error.code === 'ERR_CANCELED') {
+                return { error: 'Request cancelled' };
+            }
+            // Fall back to non-streaming
+            console.warn('[BoudicaClient] Streaming failed, falling back to regular chat:', error.message);
+            return this.chat({ ...request, stream: false });
         }
     }
 
@@ -435,8 +534,12 @@ No Memory ${message}`;
             this.client.defaults.baseURL = config.apiEndpoint;
         }
         
-        if (config.apiKey) {
-            this.client.defaults.headers.common['X-API-Key'] = config.apiKey;
+        if (config.apiKey !== undefined) {
+            if (config.apiKey) {
+                this.client.defaults.headers.common['Authorization'] = `Bearer ${config.apiKey}`;
+            } else {
+                delete this.client.defaults.headers.common['Authorization'];
+            }
         }
     }
 }

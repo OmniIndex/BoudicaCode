@@ -87,6 +87,51 @@ export class ErrorParser {
                 });
                 continue;
             }
+
+            // Parse Python traceback: "  File "path.py", line N, in function"
+            const pyFileMatch = line.match(/^\s+File "(.+?)", line (\d+)/);
+            if (pyFileMatch && i + 1 < lines.length) {
+                // The actual error follows the traceback — look ahead for it
+                const errorLine = lines.slice(i + 1).find(l => /^\w+Error:|^SyntaxError:|^IndentationError:|^NameError:|^TypeError:|^AttributeError:|^ImportError:|^ModuleNotFoundError:/.test(l));
+                errors.push({
+                    type: ErrorType.SYNTAX,
+                    file: path.basename(pyFileMatch[1]),
+                    line: parseInt(pyFileMatch[2]),
+                    message: errorLine ? errorLine.trim() : lines[i + 1]?.trim() || 'Python error',
+                    rawMessage: line
+                });
+                continue;
+            }
+
+            // Parse Rust error: "error[E0XXX]: message" followed by " --> file:line:col"
+            const rustErrMatch = line.match(/^error(?:\[E\d+\])?: (.+)$/);
+            if (rustErrMatch) {
+                const nextLine = lines[i + 1] || '';
+                const locMatch = nextLine.match(/\s+-->\s+(.+?):(\d+):(\d+)/);
+                errors.push({
+                    type: ErrorType.SYNTAX,
+                    file: locMatch ? path.basename(locMatch[1]) : undefined,
+                    line: locMatch ? parseInt(locMatch[2]) : undefined,
+                    column: locMatch ? parseInt(locMatch[3]) : undefined,
+                    message: rustErrMatch[1].trim(),
+                    rawMessage: line
+                });
+                continue;
+            }
+
+            // Parse Go error: "./file.go:line:col: message"
+            const goMatch = line.match(/^(\.\/[^\s:]+\.go):(\d+):(\d+):\s+(.+)$/);
+            if (goMatch) {
+                errors.push({
+                    type: ErrorType.SYNTAX,
+                    file: path.basename(goMatch[1]),
+                    line: parseInt(goMatch[2]),
+                    column: parseInt(goMatch[3]),
+                    message: goMatch[4].trim(),
+                    rawMessage: line
+                });
+                continue;
+            }
         }
         
         console.log(`[ErrorParser] Parsed ${errors.length} errors from build output`);

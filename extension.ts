@@ -191,11 +191,11 @@ export function activate(context: vscode.ExtensionContext) {
                 vscode.window.showErrorMessage('Please open a workspace folder first');
                 return;
             }
-            
-            // Trigger via chat panel
-            vscode.commands.executeCommand('boudicode.openChat');
-            // Note: User needs to type "build and fix" in chat
-            vscode.window.showInformationMessage('Type "build and fix" in the BoudiCode chat to start the build-fix workflow');
+
+            // Open the sidebar chat panel first, then send the trigger message
+            await vscode.commands.executeCommand('boudicodeChat.focus');
+            // Give the webview time to initialise; sendMessage will queue if not ready yet
+            await chatProvider.sendMessage('build and fix');
         }),
 
         vscode.commands.registerCommand('boudicode.cleanBuild', async () => {
@@ -273,8 +273,7 @@ export function activate(context: vscode.ExtensionContext) {
                 return;
             }
             
-            // Create output channel to show backups
-            const outputChannel = vscode.window.createOutputChannel('BoudiCode Backups');
+            // Reuse the extension's existing output channel (creating a new one each call leaks handles)
             outputChannel.clear();
             outputChannel.appendLine('Backups for: ' + filePath);
             outputChannel.appendLine('='.repeat(80));
@@ -406,21 +405,30 @@ export function activate(context: vscode.ExtensionContext) {
             if (codeBlockMatch) {
                 cleanCode = codeBlockMatch[1];
             }
-            
+
+            // Show a diff so the user can review changes before applying
+            const originalDoc = await vscode.workspace.openTextDocument(uri);
+            const updatedDoc = await vscode.workspace.openTextDocument({
+                content: cleanCode,
+                language: originalDoc.languageId
+            });
+            await vscode.commands.executeCommand(
+                'vscode.diff',
+                originalDoc.uri,
+                updatedDoc.uri,
+                `Review changes: ${path.basename(uri.fsPath)}`
+            );
+
             const confirm = await vscode.window.showWarningMessage(
                 `Apply changes to ${path.basename(uri.fsPath)}? (Current version will be backed up)`,
                 'Apply',
                 'Cancel'
             );
-            
+
             if (confirm === 'Apply') {
-                // Backup first
                 const { createBackup } = await import('./modificationExecutor');
                 await createBackup(uri.fsPath);
-                
-                // Apply changes
                 await vscode.workspace.fs.writeFile(uri, Buffer.from(cleanCode, 'utf-8'));
-                
                 vscode.window.showInformationMessage(`✅ Applied changes to ${path.basename(uri.fsPath)}`);
             }
         })
@@ -428,6 +436,18 @@ export function activate(context: vscode.ExtensionContext) {
 
     // Add all commands to subscriptions
     commands.forEach(cmd => context.subscriptions.push(cmd));
+
+    // Dispose projectScanner when extension deactivates
+    context.subscriptions.push(chatProvider['projectScanner']);
+
+    // Warn when multiple workspace folders are open (extension uses only the first)
+    if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 1) {
+        outputChannel.appendLine('⚠️  Multiple workspace folders detected. BoudiCode operates on the first folder only.');
+        vscode.window.showWarningMessage(
+            'BoudiCode: Multiple workspace folders detected. Only the first folder will be used for project scanning and build operations.',
+            'OK'
+        );
+    }
 
     // Listen for configuration changes
     context.subscriptions.push(

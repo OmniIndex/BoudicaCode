@@ -22,19 +22,24 @@ export interface ProjectStructure {
     lastScanTime: number;
 }
 
-export class ProjectScanner {
+export class ProjectScanner implements vscode.Disposable {
     private cache: ProjectStructure | null = null;
     private cacheTimeout = 30000; // 30 seconds
     private workspaceRoot: string | undefined;
-    
+    private watcher: vscode.FileSystemWatcher;
+
     constructor() {
         this.workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-        
+
         // Watch for file changes to invalidate cache
-        const watcher = vscode.workspace.createFileSystemWatcher('**/*.{cpp,hpp,h,c,ts,js,json,cmake,txt}');
-        watcher.onDidChange(() => this.invalidateCache());
-        watcher.onDidCreate(() => this.invalidateCache());
-        watcher.onDidDelete(() => this.invalidateCache());
+        this.watcher = vscode.workspace.createFileSystemWatcher('**/*.{cpp,hpp,h,c,ts,js,py,rs,go,java,cs,json,cmake,txt}');
+        this.watcher.onDidChange(() => this.invalidateCache());
+        this.watcher.onDidCreate(() => this.invalidateCache());
+        this.watcher.onDidDelete(() => this.invalidateCache());
+    }
+
+    dispose(): void {
+        this.watcher.dispose();
     }
 
     private invalidateCache(): void {
@@ -71,7 +76,7 @@ export class ProjectScanner {
         try {
             // Find all relevant files
             const patterns = {
-                source: '**/*.{cpp,c,cc,cxx,ts,js}',
+                source: '**/*.{cpp,c,cc,cxx,ts,js,py,rs,java,cs,go,rb,swift,kt}',
                 header: '**/*.{hpp,h,hxx}',
                 config: '**/*.{json,conf,yaml,yml}',
                 build: '**/CMakeLists.txt'
@@ -170,24 +175,34 @@ export class ProjectScanner {
      */
     private async analyzeFile(fileUri: vscode.Uri): Promise<FileInfo | null> {
         try {
-            const document = await vscode.workspace.openTextDocument(fileUri);
-            const content = document.getText();
+            // Use workspace.fs.readFile instead of openTextDocument to avoid polluting the document cache
+            const rawBytes = await vscode.workspace.fs.readFile(fileUri);
+            const content = Buffer.from(rawBytes).toString('utf8');
             const fileName = path.basename(fileUri.fsPath);
             const ext = path.extname(fileUri.fsPath);
             const relativePath = this.workspaceRoot 
                 ? path.relative(this.workspaceRoot, fileUri.fsPath)
                 : fileUri.fsPath;
 
+            // Derive language from extension
+            const extToLang: Record<string, string> = {
+                '.ts': 'typescript', '.tsx': 'typescriptreact', '.js': 'javascript', '.jsx': 'javascriptreact',
+                '.py': 'python', '.rs': 'rust', '.go': 'go', '.java': 'java', '.cs': 'csharp',
+                '.cpp': 'cpp', '.cc': 'cpp', '.cxx': 'cpp', '.c': 'c', '.h': 'c', '.hpp': 'cpp',
+                '.kt': 'kotlin', '.rb': 'ruby', '.swift': 'swift', '.json': 'json', '.yaml': 'yaml', '.yml': 'yaml'
+            };
+            const language = extToLang[ext.toLowerCase()] || ext.replace('.', '') || 'plaintext';
+
             const info: FileInfo = {
                 path: fileUri.fsPath,
-                relativePath: relativePath,
-                language: document.languageId,
+                relativePath,
+                language,
                 extension: ext,
-                content: content,
+                content,
                 size: content.length,
                 includes: this.extractIncludes(content),
-                functions: this.extractFunctions(content, document.languageId),
-                classes: this.extractClasses(content, document.languageId)
+                functions: this.extractFunctions(content, language),
+                classes: this.extractClasses(content, language)
             };
 
             return info;

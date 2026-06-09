@@ -36,16 +36,38 @@ export class FixGenerator {
         // Get project structure for context
         const projectStructure = await this.scanner.scanProject();
         
-        // Build fix prompt
-        const fixPrompt = await this.buildFixPrompt(errors, byType, projectStructure);
+        // Get affected files for attachment (not in prompt)
+        const affectedFiles = await this.getAffectedFiles(errors, projectStructure);
+        
+        // Build fix prompt (WITHOUT file content embedded)
+        const fixPrompt = await this.buildFixPrompt(errors, byType, projectStructure, false);
+        
+        // Build file attachment with FULL file content
+        let fileContent = '';
+        let fileName = 'affected_files.txt';
+        
+        const filesToInclude = affectedFiles.slice(0, 2); // Max 2 files
+        if (filesToInclude.length > 0) {
+            fileContent = filesToInclude.map(file => {
+                return `=== ${file.relativePath} ===\n${file.content}\n\n`;
+            }).join('\n');
+            fileName = `fix_context_${filesToInclude[0].relativePath.replace(/[\/\\]/g, '_')}`;
+            console.log(`[FixGenerator] Attaching ${filesToInclude.length} file(s) as ${fileName} (${fileContent.length} chars)`);
+        }
         
         try {
             console.log('[FixGenerator] Sending fix request to Boudica...');
+            console.log('[FixGenerator] Prompt length:', fixPrompt.length, 'chars');
+            console.log('[FixGenerator] Attachment length:', fileContent.length, 'chars');
+            
             const response = await this.client.chat({
                 message: fixPrompt,
+                file_content: fileContent.length > 0 ? fileContent : undefined,
+                file_name: fileContent.length > 0 ? fileName : undefined,
                 session_id: 'fix-' + Date.now(),
                 temperature: 0.3, // Lower temperature for more precise fixes
-                max_tokens: 2500
+                max_tokens: 2500,
+                skipClean: true   // Don't let cleanResponse strip STEP lines
             });
             
             if (response.error) {
@@ -179,7 +201,8 @@ Provide ONLY the STEP lines, nothing else.`;
                 message: reformatPrompt,
                 session_id: 'reformat-' + Date.now(),
                 temperature: 0.1, // Very low for exact formatting
-                max_tokens: 1000
+                max_tokens: 1000,
+                skipClean: true   // Don't let cleanResponse strip STEP lines
             });
             
             if (response.error || !response.response) {
@@ -197,13 +220,71 @@ Provide ONLY the STEP lines, nothing else.`;
 
     /**
      * Build a detailed prompt for Boudica to generate fixes
+     * @param includeFileContent - If false, omits file content (for use with file attachments)
      */
+    /** Detect primary language from error file extensions */
+    private detectLanguage(errors: ParsedError[]): string {
+        const extCounts: Record<string, number> = {};
+        for (const e of errors) {
+            if (e.file) {
+                const ext = path.extname(e.file).toLowerCase();
+                extCounts[ext] = (extCounts[ext] || 0) + 1;
+            }
+        }
+        const dominant = Object.entries(extCounts).sort((a, b) => b[1] - a[1])[0];
+        if (!dominant) { return 'unknown'; }
+        const extMap: Record<string, string> = {
+            '.py': 'Python', '.rs': 'Rust', '.go': 'Go', '.java': 'Java',
+            '.cs': 'C#', '.kt': 'Kotlin', '.rb': 'Ruby', '.swift': 'Swift',
+            '.ts': 'TypeScript', '.js': 'JavaScript', '.cpp': 'C++',
+            '.c': 'C', '.cc': 'C++', '.cxx': 'C++'
+        };
+        return extMap[dominant[0]] || dominant[0].replace('.', '').toUpperCase();
+    }
+
+    /** Return language-specific example STEP lines */
+    private buildExamplesForLanguage(lang: string, errors: ParsedError[]): string {
+        const exampleFile = errors.find(e => e.file)?.file || '';
+        switch (lang) {
+            case 'Python':
+                return [
+                    `STEP 1: modify ${exampleFile || 'main.py'} at line_1 - Fix SyntaxError by adding missing colon after def/if/for/class`,
+                    `STEP 2: modify ${exampleFile || 'utils.py'} at line_5 - Fix IndentationError by correcting indentation to 4 spaces`,
+                    `STEP 3: modify requirements.txt at end_of_file - Add missing_module==1.0.0`
+                ].join('\n');
+            case 'Rust':
+                return [
+                    `STEP 1: modify ${exampleFile || 'main.rs'} at line_10 - Fix borrow error by adding .clone()`,
+                    `STEP 2: modify Cargo.toml at end_of_file - Add missing dependency serde = "1"`
+                ].join('\n');
+            case 'Go':
+                return [
+                    `STEP 1: modify ${exampleFile || 'main.go'} at line_5 - Fix import by adding "fmt" to import block`,
+                    `STEP 2: modify ${exampleFile || 'main.go'} at line_12 - Fix type assertion to use comma-ok pattern`
+                ].join('\n');
+            case 'TypeScript':
+            case 'JavaScript':
+                return [
+                    `STEP 1: modify ${exampleFile || 'index.ts'} at line_3 - Add missing type annotation`,
+                    `STEP 2: modify package.json at end_of_file - Add missing dependency`
+                ].join('\n');
+            default: // C++, C, Java, etc.
+                return [
+                    `STEP 1: modify CMakeLists.txt at end_of_file - Add set(CMAKE_CXX_STANDARD 11)`,
+                    `STEP 2: modify ${exampleFile || 'main.cpp'} at beginning - Add #include <algorithm>`,
+                    `STEP 3: modify ${exampleFile || 'main.cpp'} at line_34 - Fix syntax error`
+                ].join('\n');
+        }
+    }
+
     private async buildFixPrompt(
         errors: ParsedError[],
         byType: Map<ErrorType, ParsedError[]>,
-        projectStructure: any
+        projectStructure: any,
+        includeFileContent: boolean = true
     ): Promise<string> {
-        let prompt = `I have a project that failed to build with the following errors:\n\n`;
+        const language = this.detectLanguage(errors);
+        let prompt = `I have a **${language}** project that failed to build with the following errors:\n\n`;
         
         // Add error details
         prompt += `**Build Errors (${errors.length} total):**\n\n`;
@@ -245,36 +326,53 @@ Provide ONLY the STEP lines, nothing else.`;
             prompt += `  - ${f.relativePath}\n`;
         });
         
-        // Add content of affected files
-        const affectedFiles = this.getAffectedFiles(errors, projectStructure);
-        if (affectedFiles.length > 0) {
-            prompt += `\n**Content of Affected Files:**\n\n`;
-            for (const file of affectedFiles.slice(0, 5)) { // Limit to 5 files
-                prompt += `--- ${file.relativePath} ---\n`;
-                const content = file.content.length > 3000 
-                    ? file.content.substring(0, 3000) + '\n... (truncated)'
-                    : file.content;
-                prompt += `\`\`\`${file.language}\n${content}\n\`\`\`\n\n`;
+        // Add content of affected files (only if includeFileContent is true)
+        if (includeFileContent) {
+            const affectedFiles = await this.getAffectedFiles(errors, projectStructure);
+            console.log(`[FixGenerator] Found ${affectedFiles.length} affected files to include in prompt`);
+            
+            // For file-by-file fixing: include ONLY the primary file + its header (max 2 files)
+            // This prevents overwhelming Boudica with too much context
+            const filesToInclude = affectedFiles.slice(0, 2); // HARD LIMIT: max 2 files
+            
+            if (filesToInclude.length > 0) {
+                prompt += `\n**Content of Affected Files:**\n\n`;
+                for (const file of filesToInclude) {
+                    prompt += `--- ${file.relativePath} ---\n`;
+                    // For error fixing, include more content (15000 chars max per file)
+                    // This is critical for Boudica to understand the full context
+                    const content = file.content.length > 15000 
+                        ? file.content.substring(0, 15000) + '\n... (file continues, truncated at 15000 chars)'
+                        : file.content;
+                    prompt += `\`\`\`${file.language}\n${content}\n\`\`\`\n\n`;
+                    console.log(`[FixGenerator] Including ${file.relativePath}: ${content.length} chars`);
+                }
+                
+                if (affectedFiles.length > 2) {
+                    prompt += `\n*(${affectedFiles.length - 2} more affected files not included - fixing one file at a time)*\n\n`;
+                }
+            } else {
+                console.warn('[FixGenerator] WARNING: No file content available for context');
+                prompt += `\n**NOTE:** File content not available. Using error messages only.\n\n`;
             }
+        } else {
+            // Files will be sent as attachments
+            prompt += `\n**NOTE:** Affected file content is provided as an attached document.\n\n`;
         }
         
         // Add fix instructions
         prompt += `\n**CRITICAL: You must provide SPECIFIC, ACTIONABLE fixes with EXACT filenames.**\n\n`;
+        prompt += `**This is a ${language} project. Use ${language} file extensions and syntax.**\n\n`;
         prompt += `**Required format (use this EXACT pattern):**\n`;
         prompt += `STEP N: ACTION FILENAME at LOCATION - DESCRIPTION\n\n`;
         prompt += `**Rules:**\n`;
         prompt += `- ACTION: modify, create, or delete\n`;
-        prompt += `- FILENAME: EXACT file to change (e.g., CMakeLists.txt, main.cpp)\n`;
+        prompt += `- FILENAME: EXACT file to change (must use correct language extension, e.g., .py for Python, .rs for Rust)\n`;
         prompt += `- LOCATION: line_NUMBER, end_of_file, beginning, or function_name\n`;
         prompt += `- DESCRIPTION: Exact change including code if needed\n\n`;
-        prompt += `**Common fixes:**\n`;
-        prompt += `- C++11 issues: \`STEP 1: modify CMakeLists.txt at end_of_file - Add set(CMAKE_CXX_STANDARD 11)\`\n`;
-        prompt += `- Missing include: \`STEP 1: modify main.cpp at beginning - Add #include <algorithm>\`\n`;
-        prompt += `- Wrong comment syntax: \`STEP 1: modify file.cpp at line_23 - Replace -- with //\`\n\n`;
-        prompt += `**Examples:**\n`;
-        prompt += `STEP 1: modify CMakeLists.txt at end_of_file - Add set(CMAKE_CXX_STANDARD 11)\n`;
-        prompt += `STEP 2: modify main.cpp at beginning - Add #include <algorithm>\n`;
-        prompt += `STEP 3: modify word_analyzer.cpp at line_34 - Change -- comment to // comment\n\n`;
+        prompt += `**Examples for ${language}:**\n`;
+        prompt += this.buildExamplesForLanguage(language, errors) + '\n\n';
+        prompt += `DO NOT invent filenames. Only use filenames that appear in the error messages or project structure above.\n`;
         prompt += `DO NOT give general advice. Provide SPECIFIC file modifications using the STEP format above.`;
         
         return prompt;
@@ -282,24 +380,90 @@ Provide ONLY the STEP lines, nothing else.`;
 
     /**
      * Get files affected by errors
+     * If projectStructure is empty, reads files directly from filesystem
      */
-    private getAffectedFiles(errors: ParsedError[], projectStructure: any): FileInfo[] {
+    private async getAffectedFiles(errors: ParsedError[], projectStructure: any): Promise<FileInfo[]> {
         const affectedFileNames = new Set<string>();
-        
+
         for (const error of errors) {
             if (error.file) {
                 affectedFileNames.add(error.file);
             }
         }
-        
-        const allFiles = [
+
+        const result: FileInfo[] = [];
+        const addedFiles = new Set<string>();
+
+        // First pass: try to match from the already-scanned project structure
+        const allScanned = [
             ...projectStructure.sourceFiles,
             ...projectStructure.headerFiles
         ];
-        
-        return allFiles.filter((f: FileInfo) => 
-            affectedFileNames.has(path.basename(f.path))
+
+        for (const f of allScanned as FileInfo[]) {
+            if (affectedFileNames.has(path.basename(f.path)) && !addedFiles.has(f.path)) {
+                result.push(f);
+                addedFiles.add(f.path);
+                console.log(`[FixGenerator] ✓ Found in scanner: ${path.basename(f.path)} (${f.content.length} chars)`);
+            }
+        }
+
+        // Second pass: for any file not found in the scanner, read directly from disk.
+        // This handles languages (Python, Rust, Go, …) that ProjectScanner doesn't index.
+        const notFound = Array.from(affectedFileNames).filter(
+            name => !Array.from(addedFiles).some(p => path.basename(p) === name)
         );
+
+        if (notFound.length > 0) {
+            console.log('[FixGenerator] Reading missing files directly from filesystem:', notFound);
+            const vscode = require('vscode');
+            const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
+            if (!workspaceRoot) {
+                console.log('[FixGenerator] No workspace root found');
+                return result;
+            }
+
+            const fs = require('fs');
+
+            for (const fileName of notFound) {
+                try {
+                    console.log(`[FixGenerator] Searching for ${fileName}...`);
+                    const files = await vscode.workspace.findFiles(`**/${fileName}`, '**/node_modules/**', 5);
+
+                    if (files.length > 0) {
+                        const fileUri = files[0];
+                        if (!addedFiles.has(fileUri.fsPath)) {
+                            const rawBytes = await vscode.workspace.fs.readFile(fileUri);
+                            const content = Buffer.from(rawBytes).toString('utf8');
+                            const relativePath = path.relative(workspaceRoot, fileUri.fsPath);
+                            const ext = path.extname(fileUri.fsPath);
+
+                            result.push({
+                                path: fileUri.fsPath,
+                                relativePath,
+                                language: ext.replace('.', ''),
+                                extension: ext,
+                                content,
+                                size: content.length,
+                                includes: [],
+                                functions: [],
+                                classes: []
+                            });
+                            addedFiles.add(fileUri.fsPath);
+                            console.log(`[FixGenerator] ✓ Read from disk: ${fileName} (${content.length} chars)`);
+                        }
+                    } else {
+                        console.log(`[FixGenerator] ✗ File not found in workspace: ${fileName}`);
+                    }
+                } catch (err) {
+                    console.error(`[FixGenerator] Error reading ${fileName}:`, err);
+                }
+            }
+        }
+
+        console.log(`[FixGenerator] Total files for fix context: ${result.length}`);
+        return result;
     }
 
     /**
@@ -577,7 +741,8 @@ Provide ONLY the STEP lines, nothing else.`;
         }
     ) {
         // Validate filename - reject markdown artifacts and invalid names
-        const fileName = parsed.fileName.trim();
+        // Normalise leading ./ which the build runner sometimes emits
+        const fileName = parsed.fileName.trim().replace(/^\.\//, '');
         
         // Reject if:
         // - Empty or just whitespace
@@ -589,15 +754,33 @@ Provide ONLY the STEP lines, nothing else.`;
             fileName.startsWith('```') ||
             fileName === '---' ||
             fileName === '***' ||
-            /^[^a-zA-Z0-9]/.test(fileName) || // Starts with non-alphanumeric
+            /^[^a-zA-Z0-9_]/.test(fileName) || // Starts with non-alphanumeric (allow _ prefix)
             fileName.length < 3) {
             console.log(`[FixGenerator] Rejected invalid filename: '${fileName}'`);
             return;
         }
         
         // Must have an extension or be a known config file
-        const validExtensions = ['.cpp', '.hpp', '.h', '.c', '.cc', '.cxx', '.txt', '.cmake', '.json', '.xml', '.md'];
-        const configFiles = ['CMakeLists.txt', 'Makefile', 'makefile', 'package.json', 'Cargo.toml', 'go.mod'];
+        const validExtensions = [
+            '.cpp', '.hpp', '.h', '.c', '.cc', '.cxx',
+            '.py', '.pyw',
+            '.rs',
+            '.go',
+            '.java',
+            '.cs',
+            '.kt', '.kts',
+            '.rb',
+            '.swift',
+            '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+            '.txt', '.cmake', '.json', '.xml', '.md', '.yaml', '.yml', '.toml',
+            '.sh', '.bash', '.zsh', '.fish',
+            '.html', '.css', '.scss',
+            '.sql',
+            '.r', '.R'
+        ];
+        const configFiles = ['CMakeLists.txt', 'Makefile', 'makefile', 'package.json', 'Cargo.toml', 'go.mod',
+                             'pyproject.toml', 'setup.py', 'requirements.txt', 'Pipfile', 'poetry.lock',
+                             'Dockerfile', '.env', 'pom.xml', 'build.gradle'];
         
         const hasValidExtension = validExtensions.some(ext => fileName.endsWith(ext));
         const isConfigFile = configFiles.includes(fileName);

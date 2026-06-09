@@ -107,7 +107,7 @@ export function registerChatParticipant(
     };
 
     const participant = vscode.chat.createChatParticipant('boudica', handler);
-    participant.iconPath = vscode.Uri.joinPath(context.extensionUri, 'media', 'icon.png');
+    participant.iconPath = vscode.Uri.joinPath(context.extensionUri, 'resources', 'boudica-icon.png');
     
     context.subscriptions.push(participant);
     

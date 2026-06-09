@@ -35,11 +35,62 @@ export interface BackupInfo {
 }
 
 /**
- * Create a timestamped backup of a file before modification
- * Format: filename.ext.YYYY-MM-DD.HH-mm-ss
+ * Resolve the directory where backups for a given file should be stored.
+ * Uses .boudicode/backups/<relativePathToFile>/ inside the workspace root
+ * (or the configurable boudicode.backupDirectory setting).
+ * Falls back to alongside the file if no workspace is open.
+ */
+function resolveBackupDir(filePath: string): string {
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const config = vscode.workspace.getConfiguration('boudicode');
+    const customDir = config.get<string>('backupDirectory', '');
+
+    if (customDir && path.isAbsolute(customDir)) {
+        return customDir;
+    }
+
+    if (workspaceRoot) {
+        const baseDir = customDir
+            ? path.join(workspaceRoot, customDir)
+            : path.join(workspaceRoot, '.boudicode', 'backups');
+        const rel = path.relative(workspaceRoot, filePath);
+        // Guard against paths escaping the workspace
+        const normalised = path.normalize(rel);
+        if (!normalised.startsWith('..')) {
+            return path.join(baseDir, path.dirname(normalised));
+        }
+    }
+
+    // Fallback: same directory as the file
+    return path.dirname(filePath);
+}
+
+/**
+ * Validate that a path sits inside an allowed root directory.
+ * Throws if the resolved absolute path escapes the root.
+ */
+function assertPathInside(filePath: string, allowedRoot: string, label: string): void {
+    const resolved = path.resolve(filePath);
+    const resolvedRoot = path.resolve(allowedRoot);
+    if (!resolved.startsWith(resolvedRoot + path.sep) && resolved !== resolvedRoot) {
+        throw new Error(`Security: ${label} path '${resolved}' is outside allowed root '${resolvedRoot}'`);
+    }
+}
+
+/**
+ * Create a timestamped backup of a file before modification.
+ * Backups are stored in .boudicode/backups/<relPath>/ inside the workspace
+ * (configurable via boudicode.backupDirectory).
  */
 export async function createBackup(filePath: string): Promise<string> {
     try {
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
+        // Path traversal protection: file must be inside the workspace (if one is open)
+        if (workspaceRoot) {
+            assertPathInside(filePath, workspaceRoot, 'Source');
+        }
+
         const now = new Date();
         const timestamp = now.getFullYear() + '-' +
             String(now.getMonth() + 1).padStart(2, '0') + '-' +
@@ -47,18 +98,18 @@ export async function createBackup(filePath: string): Promise<string> {
             String(now.getHours()).padStart(2, '0') + '-' +
             String(now.getMinutes()).padStart(2, '0') + '-' +
             String(now.getSeconds()).padStart(2, '0');
-        
-        const backupPath = filePath + '.' + timestamp;
-        
-        // Read original file
+
+        const backupDir = resolveBackupDir(filePath);
+        await fs.promises.mkdir(backupDir, { recursive: true });
+
+        const backupPath = path.join(backupDir, path.basename(filePath) + '.' + timestamp);
+
         const content = await fs.promises.readFile(filePath, 'utf8');
-        
-        // Write backup
         await fs.promises.writeFile(backupPath, content, 'utf8');
-        
+
         console.log('[ModificationExecutor] Created backup: ' + backupPath);
         return backupPath;
-        
+
     } catch (error) {
         console.error('[ModificationExecutor] Failed to create backup:', error);
         throw new Error('Failed to create backup: ' + error);
@@ -66,87 +117,88 @@ export async function createBackup(filePath: string): Promise<string> {
 }
 
 /**
- * List all backups for a given file
- * Returns array of backup paths sorted by timestamp (newest first)
+ * List all backups for a given file.
+ * Searches both the dedicated .boudicode/backups directory and (legacy) the file's own directory.
+ * Returns array of backup paths sorted by timestamp (newest first).
  */
 export async function listBackups(filePath: string): Promise<BackupInfo[]> {
-    try {
-        const dir = path.dirname(filePath);
-        const baseName = path.basename(filePath);
-        
-        // Read directory
-        const files = await fs.promises.readdir(dir);
-        
-        // Filter for backups matching pattern: filename.ext.YYYY-MM-DD.HH-mm-ss
-        const backupPattern = new RegExp('^' + baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\.\\d{4}-\\d{2}-\\d{2}\\.\\d{2}-\\d{2}-\\d{2}$');
-        const backupFiles = files.filter(f => backupPattern.test(f));
-        
-        // Get info for each backup
-        const backups: BackupInfo[] = [];
-        for (const backupFile of backupFiles) {
-            const backupPath = path.join(dir, backupFile);
-            const stats = await fs.promises.stat(backupPath);
-            
-            // Parse timestamp from filename
-            const timestampMatch = backupFile.match(/\.(\d{4})-(\d{2})-(\d{2})\.(\d{2})-(\d{2})-(\d{2})$/);
-            if (timestampMatch) {
-                const timestamp = new Date(
-                    parseInt(timestampMatch[1]),  // year
-                    parseInt(timestampMatch[2]) - 1,  // month (0-indexed)
-                    parseInt(timestampMatch[3]),  // day
-                    parseInt(timestampMatch[4]),  // hour
-                    parseInt(timestampMatch[5]),  // minute
-                    parseInt(timestampMatch[6])   // second
-                );
-                
-                backups.push({
-                    originalPath: filePath,
-                    backupPath: backupPath,
-                    timestamp: timestamp,
-                    size: stats.size
-                });
+    const backups: BackupInfo[] = [];
+    const baseName = path.basename(filePath);
+    const backupPattern = new RegExp('^' + baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\.\\d{4}-\\d{2}-\\d{2}\.\\d{2}-\\d{2}-\\d{2}$');
+
+    async function scanDir(dir: string) {
+        try {
+            const files = await fs.promises.readdir(dir);
+            for (const file of files) {
+                if (!backupPattern.test(file)) { continue; }
+                const bPath = path.join(dir, file);
+                const stats = await fs.promises.stat(bPath);
+                const m = file.match(/\.(\d{4})-(\d{2})-(\d{2})\.(\d{2})-(\d{2})-(\d{2})$/);
+                if (m) {
+                    backups.push({
+                        originalPath: filePath,
+                        backupPath: bPath,
+                        timestamp: new Date(
+                            parseInt(m[1]), parseInt(m[2]) - 1, parseInt(m[3]),
+                            parseInt(m[4]), parseInt(m[5]), parseInt(m[6])
+                        ),
+                        size: stats.size
+                    });
+                }
             }
-        }
-        
-        // Sort by timestamp (newest first)
-        backups.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
-        
-        return backups;
-        
-    } catch (error) {
-        console.error('[ModificationExecutor] Failed to list backups:', error);
-        return [];
+        } catch { /* directory may not exist */ }
     }
+
+    // Search dedicated backup directory
+    await scanDir(resolveBackupDir(filePath));
+
+    // Also scan the file's own directory for legacy backups
+    const legacyDir = path.dirname(filePath);
+    if (legacyDir !== resolveBackupDir(filePath)) {
+        await scanDir(legacyDir);
+    }
+
+    backups.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+    return backups;
 }
 
 /**
- * Restore a file from a backup
+ * Restore a file from a backup, with path traversal protection.
  */
 export async function restoreFromBackup(backupPath: string, originalPath: string): Promise<boolean> {
     try {
-        // Verify backup exists
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
+        // Validate both paths are inside workspace (if one is open)
+        if (workspaceRoot) {
+            const backupRoot = resolveBackupDir(originalPath);
+            // backupPath must be in backup dir OR workspace (for legacy backups)
+            const resolvedBackup = path.resolve(backupPath);
+            const inBackupDir = resolvedBackup.startsWith(path.resolve(backupRoot));
+            const inWorkspace = resolvedBackup.startsWith(path.resolve(workspaceRoot));
+            if (!inBackupDir && !inWorkspace) {
+                throw new Error(`Security: backup path '${resolvedBackup}' is outside allowed directories`);
+            }
+            assertPathInside(originalPath, workspaceRoot, 'Restore target');
+        }
+
         if (!fs.existsSync(backupPath)) {
             throw new Error('Backup file not found: ' + backupPath);
         }
-        
+
         // Create a backup of the current state before restoring
         if (fs.existsSync(originalPath)) {
-            try {
-                await createBackup(originalPath);
-            } catch (backupError) {
-                console.warn('[ModificationExecutor] Could not backup current state before restore:', backupError);
+            try { await createBackup(originalPath); } catch (e) {
+                console.warn('[ModificationExecutor] Could not backup current state before restore:', e);
             }
         }
-        
-        // Read backup content
+
         const content = await fs.promises.readFile(backupPath, 'utf8');
-        
-        // Write to original location
         await fs.promises.writeFile(originalPath, content, 'utf8');
-        
+
         console.log('[ModificationExecutor] Restored from backup: ' + backupPath);
         return true;
-        
+
     } catch (error) {
         console.error('[ModificationExecutor] Failed to restore from backup:', error);
         return false;
@@ -458,7 +510,7 @@ export async function executeModificationPlan(
                     );
                     
                     if (answer === 'Yes') {
-                        fs.unlinkSync(filePath);
+                        await fs.promises.unlink(filePath);
                         filesModified.push(step.fileName);
                     }
                 }
@@ -702,21 +754,27 @@ Requirements:
 
         const code = extractCodeFromResponse(response.response);
         
-        // Determine where to save the file
-        let savePath = fileName;
+        // Security: prevent AI-generated fileName from escaping workspace
+        const normalizedFileName = path.normalize(fileName).replace(/^(\.\.\/|\.\.\\)+/, '');
+        let savePath = normalizedFileName;
         const srcDir = path.join(workspaceRoot, 'src');
-        if (fs.existsSync(srcDir) && (fileName.endsWith('.cpp') || fileName.endsWith('.hpp'))) {
-            savePath = path.join('src', path.basename(fileName));
+        if (fs.existsSync(srcDir) && (normalizedFileName.endsWith('.cpp') || normalizedFileName.endsWith('.hpp'))) {
+            savePath = path.join('src', path.basename(normalizedFileName));
         }
         
         const filePath = path.join(workspaceRoot, savePath);
+        // Final traversal check
+        if (!path.resolve(filePath).startsWith(path.resolve(workspaceRoot) + path.sep)) {
+            console.error(`[ModificationExecutor] Rejected path traversal attempt: ${filePath}`);
+            return false;
+        }
         const fileDir = path.dirname(filePath);
         
         if (!fs.existsSync(fileDir)) {
             fs.mkdirSync(fileDir, { recursive: true });
         }
         
-        fs.writeFileSync(filePath, code, 'utf-8');
+        await fs.promises.writeFile(filePath, code, 'utf-8');
         
         // Open the file
         const doc = await vscode.workspace.openTextDocument(filePath);

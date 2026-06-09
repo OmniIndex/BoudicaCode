@@ -60,6 +60,16 @@ export class SessionManager {
         return path.join(this.sessionsDir, `session-${dateString}.json`);
     }
 
+    private async loadSessionAsync(dateString: string): Promise<SessionFile | null> {
+        const sessionPath = this.getSessionPath(dateString);
+        try {
+            const data = await fs.promises.readFile(sessionPath, 'utf8');
+            return JSON.parse(data);
+        } catch {
+            return null;
+        }
+    }
+
     /**
      * Load session file for a specific date
      */
@@ -80,22 +90,20 @@ export class SessionManager {
     }
 
     /**
-     * Save session file
+     * Save session file asynchronously (fire-and-forget to avoid blocking the main thread)
      */
     private saveSession(session: SessionFile): void {
         const sessionPath = this.getSessionPath(session.date);
-        
-        try {
-            fs.writeFileSync(sessionPath, JSON.stringify(session, null, 2), 'utf8');
-        } catch (error) {
-            console.error(`[SessionManager] Error saving session ${session.date}:`, error);
-        }
+        fs.promises.writeFile(sessionPath, JSON.stringify(session, null, 2), 'utf8')
+            .catch(error => {
+                console.error(`[SessionManager] Error saving session ${session.date}:`, error);
+            });
     }
 
     /**
      * Get or create today's session
      */
-    private getTodaySession(): SessionFile {
+    private async getTodaySession(): Promise<SessionFile> {
         const today = this.getDateString(new Date());
         
         // Check if date changed
@@ -109,8 +117,8 @@ export class SessionManager {
             return this.currentSession;
         }
 
-        // Try to load from disk
-        let session = this.loadSession(today);
+        // Try to load from disk (async)
+        let session = await this.loadSessionAsync(today);
         
         // Create new if doesn't exist
         if (!session) {
@@ -127,13 +135,13 @@ export class SessionManager {
     /**
      * Log an interaction to today's session
      */
-    public logInteraction(
+    public async logInteraction(
         source: 'native' | 'sidebar',
         userPrompt: string,
         assistantResponse: string,
         files: string[] = []
-    ): void {
-        const session = this.getTodaySession();
+    ): Promise<void> {
+        const session = await this.getTodaySession();
         
         session.interactions.push({
             timestamp: new Date().toISOString(),
@@ -230,28 +238,25 @@ export class SessionManager {
      * Clean up sessions older than 10 days
      */
     private cleanupOldSessions(): void {
-        try {
-            const files = fs.readdirSync(this.sessionsDir);
-            const today = new Date();
-            const cutoffDate = new Date(today);
-            cutoffDate.setDate(cutoffDate.getDate() - 10);
-            const cutoffString = this.getDateString(cutoffDate);
+        const today = new Date();
+        const cutoffDate = new Date(today);
+        cutoffDate.setDate(cutoffDate.getDate() - 10);
+        const cutoffString = this.getDateString(cutoffDate);
 
-            files.forEach(file => {
-                if (file.startsWith('session-') && file.endsWith('.json')) {
-                    const dateString = file.replace('session-', '').replace('.json', '');
-                    
-                    // Delete if older than 10 days
-                    if (dateString < cutoffString) {
-                        const filePath = path.join(this.sessionsDir, file);
-                        fs.unlinkSync(filePath);
-                        console.log(`[SessionManager] Cleaned up old session: ${dateString}`);
-                    }
-                }
+        fs.promises.readdir(this.sessionsDir)
+            .then(files => {
+                const deletes = files
+                    .filter(f => f.startsWith('session-') && f.endsWith('.json'))
+                    .map(f => ({ file: f, date: f.replace('session-', '').replace('.json', '') }))
+                    .filter(({ date }) => date < cutoffString)
+                    .map(({ file }) =>
+                        fs.promises.unlink(path.join(this.sessionsDir, file)).catch(() => { /* ignore */ })
+                    );
+                return Promise.all(deletes);
+            })
+            .catch(error => {
+                console.error('[SessionManager] Error during cleanup:', error);
             });
-        } catch (error) {
-            console.error('[SessionManager] Error during cleanup:', error);
-        }
     }
 
     /**

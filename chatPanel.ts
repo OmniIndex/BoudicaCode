@@ -13,12 +13,13 @@ import { isPlanningRequest, generatePlan, executePlan, ExecutionPlan, isModifica
 import { ProjectScanner } from './projectScanner';
 import { generateModificationPlan, executeModificationPlan } from './modificationExecutor';
 import { BuildRunner } from './buildRunner';
-import { ErrorParser } from './errorParser';
+import { ErrorParser, ParsedError } from './errorParser';
 import { FixGenerator } from './fixGenerator';
 import { CodeSearch } from './codeSearch';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'boudicodeChat';
+    private static readonly MAX_HISTORY = 100;
     private view?: vscode.WebviewView;
     private client: BoudicaClient;
     private sessionId: string;
@@ -26,7 +27,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private conversationHistory: Array<{role: 'user' | 'assistant', content: string}> = [];
     private isCreatingFiles: boolean = false;
     private pendingCompletionMessage?: string;
+    private pendingMessages: string[] = [];
     private projectScanner: ProjectScanner;
+    private pendingFixes: Map<string, { fixPlan: any, errors: ParsedError[] }> = new Map();
 
     constructor(
         private readonly extensionUri: vscode.Uri,
@@ -40,21 +43,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     /**
-     * Send a message programmatically (called from external sources like native chat participant)
+     * Send a message programmatically (called from external sources like native chat participant
+     * or the buildAndFix command). Queues if the webview is not yet visible.
      */
     public async sendMessage(message: string): Promise<void> {
         if (!this.view) {
-            console.log('[ChatPanel] View not ready, cannot send message');
+            // Queue for when the view becomes ready
+            this.pendingMessages.push(message);
+            console.log('[ChatPanel] View not ready, queued message:', message);
             return;
         }
-        
+
         // Send message to webview to display in UI
         this.view.webview.postMessage({
             command: 'addMessage',
             role: 'user',
-            content: message + '\n\n📨 *Received from native chat*'
+            content: message + '\n\n\ud83d\udce8 *Received from native chat*'
         });
-        
+
         // Process the message through normal flow
         await this.handleSendMessage(message);
     }
@@ -99,7 +105,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     // Restore conversation history when webview signals it's ready
                     console.log('[Extension] Webview ready, restoring history');
                     this.restoreConversationHistory();
-                    
+
                     // Show pending completion message if exists
                     if (this.pendingCompletionMessage) {
                         console.log('[Extension] Showing pending completion message');
@@ -114,6 +120,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         });
                         this.pendingCompletionMessage = undefined;
                     }
+
+                    // Process any queued messages
+                    if (this.pendingMessages.length > 0) {
+                        const queued = this.pendingMessages.splice(0);
+                        for (const msg of queued) {
+                            await this.handleSendMessage(msg);
+                        }
+                    }
                     break;
                 case 'sendMessage':
                     await this.handleSendMessage(message.text);
@@ -126,6 +140,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'includeFile':
                     await this.handleIncludeFile();
+                    break;
+                case 'applyFix':
+                    await this.applyFix(message.fileName);
+                    break;
+                case 'skipFix':
+                    this.skipFix(message.fileName);
+                    break;
+                case 'applyAllFixes':
+                    await this.applyAllFixes();
                     break;
             }
         });
@@ -322,11 +345,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             return;
         }
 
-        // Add user message to history
+        // Add user message to history (cap at MAX_HISTORY)
         this.conversationHistory.push({
             role: 'user',
             content: userMessage
         });
+        if (this.conversationHistory.length > ChatViewProvider.MAX_HISTORY) {
+            this.conversationHistory = this.conversationHistory.slice(-ChatViewProvider.MAX_HISTORY);
+        }
 
         // Get active file content as context FIRST
         const fileContext = await this.getActiveFileContext();
@@ -413,16 +439,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 message: enhancedMessage,
                 session_id: this.sessionId,
                 // If we have file context, attach it properly as multipart/form-data
-                ...(fileContext && fileName && { 
+                ...(fileContext && fileName && {
                     file_content: fileContext,
                     file_name: fileName
                 })
             };
             console.log('[Extension] Sending request. File:', fileName || 'none');
-            console.log('[Extension] Calling client.chat()...');
+            console.log('[Extension] Calling client.chatStream()...');
 
-            const response = await this.client.chat(request);
-            console.log('[Extension] Response received:', response.error ? 'ERROR' : 'SUCCESS');
+            // Stream the response so the user gets incremental feedback
+            const streamMsgId = 'stream-' + Date.now();
+            this.view.webview.postMessage({ command: 'startStreamMessage', id: streamMsgId });
+
+            const response = await this.client.chatStream(
+                request,
+                (chunk) => {
+                    this.view?.webview.postMessage({ command: 'appendStreamChunk', id: streamMsgId, text: chunk });
+                }
+            );
+
+            this.view.webview.postMessage({ command: 'endStreamMessage', id: streamMsgId, tokensPerSecond: response.tokens_per_second });
+            console.log('[Extension] Stream complete:', response.error ? 'ERROR' : 'SUCCESS');
 
             // Hide typing indicator
             this.view.webview.postMessage({
@@ -441,27 +478,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     content: `Error: ${response.error}`
                 });
             } else if (response.response) {
+                const finalText = response.response;
+
                 // Check if response contains code that should be saved as a file
-                // Pass the user's message so we can extract filename from prompt if needed
-                const summaryMessage = await this.handleCodeResponse(response.response, userMessage);
-                
-                // Add assistant response to history (keep full response in history)
+                const summaryMessage = await this.handleCodeResponse(finalText, userMessage);
+
+                // Add assistant response to history (cap at MAX_HISTORY)
                 this.conversationHistory.push({
                     role: 'assistant',
-                    content: response.response
+                    content: finalText
                 });
+                if (this.conversationHistory.length > ChatViewProvider.MAX_HISTORY) {
+                    this.conversationHistory = this.conversationHistory.slice(-ChatViewProvider.MAX_HISTORY);
+                }
 
                 // Log interaction to session
-                this.sessionManager.logInteraction('sidebar', userMessage, response.response, fileName ? [fileName] : []);
+                this.sessionManager.logInteraction('sidebar', userMessage, finalText, fileName ? [fileName] : []);
 
-                // Display either summary message (if files saved) or full response
-                const displayContent = summaryMessage || response.response;
-                this.view.webview.postMessage({
-                    command: 'addMessage',
-                    role: 'assistant',
-                    content: displayContent,
-                    tokensPerSecond: response.tokens_per_second
-                });
+                // If files were saved, show summary message as additional message
+                if (summaryMessage) {
+                    this.view.webview.postMessage({
+                        command: 'addMessage',
+                        role: 'assistant',
+                        content: summaryMessage
+                    });
+                }
             }
         } catch (error: any) {
 
@@ -548,6 +589,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     content: `❌ Directory not found: \`${absolutePath}\`\n\nPlease check the path and try again.`
                 });
                 return;
+            }
+
+            // Security: only allow reading within the workspace or sub-paths explicitly provided
+            // (the user typed the path, but we still gate to prevent accidental access to /etc etc.)
+            const workspaceFolder2 = vscode.workspace.workspaceFolders?.[0];
+            if (workspaceFolder2) {
+                const resolvedAbs = path.resolve(absolutePath);
+                const resolvedWs = path.resolve(workspaceFolder2.uri.fsPath);
+                if (!resolvedAbs.startsWith(resolvedWs + path.sep) && resolvedAbs !== resolvedWs) {
+                    const confirm = await vscode.window.showWarningMessage(
+                        `Directory "${absolutePath}" is outside the current workspace. Proceed?`,
+                        'Yes', 'No'
+                    );
+                    if (confirm !== 'Yes') {
+                        this.view?.webview.postMessage({ command: 'setTyping', typing: false });
+                        return;
+                    }
+                }
             }
             
             // Find matching files
@@ -1096,6 +1155,295 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     /**
+     * Group errors by file for file-by-file processing
+     */
+    private groupErrorsByFile(errors: ParsedError[]): Map<string, ParsedError[]> {
+        const errorsByFile = new Map<string, ParsedError[]>();
+        
+        for (const error of errors) {
+            const file = error.file || 'unknown';
+            if (!errorsByFile.has(file)) {
+                errorsByFile.set(file, []);
+            }
+            errorsByFile.get(file)!.push(error);
+        }
+        
+        console.log(`[ChatPanel] Grouped ${errors.length} errors into ${errorsByFile.size} file(s):`);
+        errorsByFile.forEach((errs, file) => {
+            console.log(`[ChatPanel]   ${file}: ${errs.length} error(s)`);
+        });
+        
+        return errorsByFile;
+    }
+
+    /**
+     * Fix errors one file at a time to avoid timeouts
+     */
+    private async fixErrorsByFile(errorsByFile: Map<string, ParsedError[]>, errorSummary: string): Promise<void> {
+        const statusBarManager = getStatusBarManager();
+        const files = Array.from(errorsByFile.keys()).filter(f => f !== 'unknown');
+        const totalFiles = files.length;
+        
+        this.view?.webview.postMessage({
+            command: 'addMessage',
+            role: 'assistant',
+            content: `🔧 **File-by-file error fixing**\n\nProcessing ${totalFiles} file(s) with errors...\n`
+        });
+        
+        const fixGenerator = new FixGenerator(this.client, this.projectScanner);
+        let fixedFiles = 0;
+        let totalChanges = 0;
+        
+        for (let i = 0; i < files.length; i++) {
+            const file = files[i];
+            const errors = errorsByFile.get(file)!;
+            const fileNum = i + 1;
+            
+            console.log(`[ChatPanel] Processing file ${fileNum}/${totalFiles}: ${file} with ${errors.length} errors`);
+            console.log(`[ChatPanel] Error files in this batch:`, errors.map(e => e.file).filter((v, i, a) => a.indexOf(v) === i));
+            
+            this.view?.webview.postMessage({
+                command: 'addMessage',
+                role: 'assistant',
+                content: `\n📁 **[${fileNum}/${totalFiles}] ${file}** (${errors.length} error${errors.length > 1 ? 's' : ''})\n\n🤔 Generating fixes...`
+            });
+            
+            statusBarManager.showOperation('Fixing', `${file} (${fileNum}/${totalFiles})`);
+            
+            // Generate fix plan for this file only
+            const fixResult = await fixGenerator.generateFixPlan(errors);
+            
+            if (!fixResult.plan || fixResult.plan.steps.length === 0) {
+                this.view?.webview.postMessage({
+                    command: 'addMessage',
+                    role: 'assistant',
+                    content: `⚠️ Could not generate fixes for ${file}\n`
+                });
+                continue;
+            }
+            
+            const fixPlan = fixResult.plan;
+            
+            // Show preview with approval buttons
+            const previewContent = this.formatFixPreview(fixPlan, file, errors.length);
+            this.view?.webview.postMessage({
+                command: 'showFixPreview',
+                file: file,
+                fileNum: fileNum,
+                totalFiles: totalFiles,
+                fixPlan: fixPlan,
+                previewContent: previewContent,
+                errorCount: errors.length
+            });
+            
+            // Store pending fix for this file
+            this.pendingFixes.set(file, { fixPlan, errors });
+            
+            // Wait for user approval (will be handled by webview message handler)
+            // For now, continue to next file to show all previews
+        }
+        
+        // Show summary after all previews
+        this.view?.webview.postMessage({
+            command: 'addMessage',
+            role: 'assistant',
+            content: `\n📋 **Generated ${files.length} fix plan(s)**\n\nReview and approve each fix above to apply changes.`
+        });
+        
+        statusBarManager.showOperation('Building', 'Rebuilding project...');
+        
+        // Rebuild after all fixes
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+        const buildRunner = new BuildRunner(workspaceRoot);
+        const rebuildResult = await buildRunner.runBuild();
+        
+        if (rebuildResult.success) {
+            this.view?.webview.postMessage({
+                command: 'addMessage',
+                role: 'assistant',
+                content: '✅ **Build successful!**'
+            });
+            statusBarManager.showSuccess('Build successful');
+        } else {
+            this.view?.webview.postMessage({
+                command: 'addMessage',
+                role: 'assistant',
+                content: `⚠️ **Build still failing**\n\nRemaining errors may require manual review.`
+            });
+            statusBarManager.showError('Build failed');
+        }
+        
+        statusBarManager.clearOperation();
+    }
+
+    /**
+     * Format fix plan as readable preview
+     */
+    private formatFixPreview(fixPlan: any, fileName: string, errorCount: number): string {
+        let preview = `**Proposed Fixes for ${fileName}** (${errorCount} error${errorCount > 1 ? 's' : ''}):\n\n`;
+        preview += '```\n';
+        preview += '─'.repeat(60) + '\n';
+        
+        for (let i = 0; i < fixPlan.steps.length; i++) {
+            const step = fixPlan.steps[i];
+            const actionIcon = step.action === 'modify' ? '✏️' : step.action === 'create' ? '➕' : '❌';
+            
+            preview += `\nSTEP ${i + 1}: ${actionIcon} ${step.action.toUpperCase()} ${step.fileName}\n`;
+            
+            if (step.targetLocation) {
+                preview += `  Location: ${step.targetLocation}\n`;
+            }
+            
+            if (step.description) {
+                preview += `  Change: ${step.description}\n`;
+            }
+            
+            if (step.content && step.content.length < 200) {
+                preview += `  Code:\n    ${step.content.split('\n').join('\n    ')}\n`;
+            }
+        }
+        
+        preview += '\n' + '─'.repeat(60) + '\n';
+        preview += '```\n';
+        
+        return preview;
+    }
+
+    /**
+     * Apply approved fix for a specific file
+     */
+    private async applyFix(fileName: string): Promise<void> {
+        const pending = this.pendingFixes.get(fileName);
+        if (!pending) {
+            this.view?.webview.postMessage({
+                command: 'addMessage',
+                role: 'error',
+                content: `⚠️ No pending fix found for ${fileName}`
+            });
+            return;
+        }
+
+        const { fixPlan } = pending;
+        const statusBarManager = getStatusBarManager();
+        
+        this.view?.webview.postMessage({
+            command: 'addMessage',
+            role: 'assistant',
+            content: `⚙️ Applying fixes to ${fileName}...`
+        });
+        
+        statusBarManager.showOperation('Applying', `Fixing ${fileName}`);
+        
+        try {
+            const result = await executeModificationPlan(
+                this.client,
+                fixPlan,
+                this.projectScanner,
+                `Fix errors in ${fileName}`,
+                vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd(),
+                () => {}
+            );
+            
+            const fileChanges = result.filesModified.length + result.filesCreated.length;
+            if (result.success && fileChanges > 0) {
+                this.view?.webview.postMessage({
+                    command: 'addMessage',
+                    role: 'assistant',
+                    content: `✅ Applied ${fileChanges} change(s) to ${fileName}`
+                });
+                this.pendingFixes.delete(fileName);
+            } else {
+                this.view?.webview.postMessage({
+                    command: 'addMessage',
+                    role: 'error',
+                    content: `⚠️ Failed to apply changes to ${fileName}`
+                });
+            }
+        } catch (error) {
+            this.view?.webview.postMessage({
+                command: 'addMessage',
+                role: 'error',
+                content: `❌ Error applying fixes: ${error instanceof Error ? error.message : String(error)}`
+            });
+        } finally {
+            statusBarManager.clearOperation();
+        }
+    }
+
+    /**
+     * Skip fix for a specific file
+     */
+    private skipFix(fileName: string): void {
+        this.pendingFixes.delete(fileName);
+        this.view?.webview.postMessage({
+            command: 'addMessage',
+            role: 'assistant',
+            content: `⏭️ Skipped fixes for ${fileName}`
+        });
+    }
+
+    /**
+     * Apply all pending fixes and rebuild
+     */
+    private async applyAllFixes(): Promise<void> {
+        const files = Array.from(this.pendingFixes.keys());
+        if (files.length === 0) {
+            this.view?.webview.postMessage({
+                command: 'addMessage',
+                role: 'assistant',
+                content: `⚠️ No pending fixes to apply`
+            });
+            return;
+        }
+
+        this.view?.webview.postMessage({
+            command: 'addMessage',
+            role: 'assistant',
+            content: `⚙️ Applying all ${files.length} fix plan(s)...`
+        });
+
+        let appliedCount = 0;
+        for (const file of files) {
+            await this.applyFix(file);
+            if (!this.pendingFixes.has(file)) {
+                appliedCount++;
+            }
+        }
+
+        this.view?.webview.postMessage({
+            command: 'addMessage',
+            role: 'assistant',
+            content: `\n✅ Applied ${appliedCount}/${files.length} fix plan(s)\n\n🔨 **Rebuilding...**`
+        });
+
+        // Rebuild after all fixes
+        const statusBarManager = getStatusBarManager();
+        statusBarManager.showOperation('Building', 'Rebuilding project...');
+        
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+        const buildRunner = new BuildRunner(workspaceRoot);
+        const rebuildResult = await buildRunner.runBuild();
+        
+        if (rebuildResult.success) {
+            this.view?.webview.postMessage({
+                command: 'addMessage',
+                role: 'assistant',
+                content: '✅ **Build successful!**'
+            });
+            statusBarManager.showSuccess('Build successful');
+        } else {
+            this.view?.webview.postMessage({
+                command: 'addMessage',
+                role: 'assistant',
+                content: `⚠️ **Build still failing**\n\nRemaining errors may require manual review.`
+            });
+            statusBarManager.showError('Build failed');
+        }
+        
+        statusBarManager.clearOperation();
+    }
+
+    /**
      * Handle session search in sidebar
      */
     private async handleSessionSearch(userMessage: string) {
@@ -1309,20 +1657,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 role: 'assistant',
                 content: `❌ **Build failed** (${buildResult.buildSystem})\n\n🔍 Analyzing errors...`
             });
-            
+
             const errorParser = new ErrorParser();
             const parsedErrors = errorParser.parseOutput(buildResult.output);
-            
+
             if (parsedErrors.length === 0) {
-                // No parseable errors
-                const fallbackMessage = `❌ **Build failed** but I couldn't parse the errors.\n\n\`\`\`\n${buildResult.output.substring(0, 2000)}\n\`\`\``;
-                
+                // No parseable errors — show whatever the build runner captured
+                const rawText = buildResult.output.trim() || buildResult.errors.join('\n');
+                const fallbackMessage = rawText
+                    ? `❌ **Build failed** but I couldn't parse specific error lines.\n\n\`\`\`\n${rawText.substring(0, 2000)}\n\`\`\``
+                    : `❌ **Build failed** with no output. Check that the build tool is installed and accessible.`;
+
                 this.view?.webview.postMessage({
                     command: 'addMessage',
                     role: 'error',
                     content: fallbackMessage
                 });
-                
+
                 return;
             }
             
@@ -1336,6 +1687,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 content: `📋 **Error Analysis:**\n\n${errorSummary}\n\n**Details:**\n${errorDetails}`
             });
             
+            // Group errors by file
+            const errorsByFile = this.groupErrorsByFile(parsedErrors);
+            const fileCount = Object.keys(errorsByFile).length;
+            
+            // If multiple files have errors, use file-by-file approach
+            if (fileCount > 1) {
+                await this.fixErrorsByFile(errorsByFile, errorSummary);
+                return;
+            }
+            
+            // Single file or no file info - use original bulk approach
             // Generate fixes
             this.view?.webview.postMessage({
                 command: 'addMessage',
@@ -2002,6 +2364,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'addMessage':
                     addMessage(message.role, message.content, message.tokensPerSecond);
                     break;
+                case 'startStreamMessage':
+                    startStreamMessage(message.id);
+                    break;
+                case 'appendStreamChunk':
+                    appendStreamChunk(message.id, message.text);
+                    break;
+                case 'endStreamMessage':
+                    endStreamMessage(message.id, message.tokensPerSecond);
+                    break;
                 case 'setTyping':
                     console.log('[Webview] setTyping called, typing:', message.typing);
                     typingIndicator.classList.toggle('active', message.typing);
@@ -2021,8 +2392,62 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                         fileContextInfo.style.display = 'none';
                     }, 3000);
                     break;
+                case 'showFixPreview':
+                    addMessage('assistant', message.previewContent);
+                    addFixButtons(message.file, message.fileNum, message.totalFiles);
+                    break;
             }
         });
+
+        // Streaming helpers
+        const streamingMessages = {};
+
+        function startStreamMessage(id) {
+            const welcomeEl = document.getElementById('welcome');
+            if (welcomeEl) { welcomeEl.remove(); }
+
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message assistant';
+            messageDiv.id = 'stream-' + id;
+
+            const header = document.createElement('div');
+            header.className = 'message-header';
+            header.textContent = '🤖 Boudica';
+
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'message-content';
+            contentDiv.id = 'stream-content-' + id;
+            contentDiv.textContent = '';
+
+            messageDiv.appendChild(header);
+            messageDiv.appendChild(contentDiv);
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            streamingMessages[id] = contentDiv;
+        }
+
+        function appendStreamChunk(id, text) {
+            const contentDiv = streamingMessages[id];
+            if (contentDiv) {
+                contentDiv.textContent += text;
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            }
+        }
+
+        function endStreamMessage(id, tokensPerSecond) {
+            const contentDiv = streamingMessages[id];
+            if (contentDiv) {
+                const messageDiv = document.getElementById('stream-' + id);
+                if (tokensPerSecond && messageDiv) {
+                    const meta = document.createElement('div');
+                    meta.className = 'message-meta';
+                    meta.textContent = '⚡ ' + tokensPerSecond.toFixed(1) + ' tokens/sec';
+                    messageDiv.appendChild(meta);
+                }
+                delete streamingMessages[id];
+            }
+            sendButton.disabled = false;
+        }
 
         function addMessage(role, content, tokensPerSecond) {
             // Remove welcome message if present
@@ -2059,6 +2484,73 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
             // Re-enable send button
             sendButton.disabled = false;
+        }
+
+        function addFixButtons(fileName, fileNum, totalFiles) {
+            const buttonsDiv = document.createElement('div');
+            buttonsDiv.className = 'fix-buttons';
+            buttonsDiv.style.display = 'flex';
+            buttonsDiv.style.gap = '8px';
+            buttonsDiv.style.marginTop = '12px';
+            buttonsDiv.style.padding = '8px';
+            buttonsDiv.style.borderTop = '1px solid var(--vscode-panel-border)';
+
+            const approveBtn = document.createElement('button');
+            approveBtn.textContent = '✅ Apply Fix';
+            approveBtn.className = 'fix-button approve';
+            approveBtn.style.flex = '1';
+            approveBtn.style.padding = '8px 16px';
+            approveBtn.style.backgroundColor = 'var(--vscode-button-background)';
+            approveBtn.style.color = 'var(--vscode-button-foreground)';
+            approveBtn.style.border = 'none';
+            approveBtn.style.borderRadius = '4px';
+            approveBtn.style.cursor = 'pointer';
+            approveBtn.onclick = () => {
+                vscode.postMessage({ command: 'applyFix', fileName: fileName });
+                buttonsDiv.remove();
+            };
+
+            const skipBtn = document.createElement('button');
+            skipBtn.textContent = '⏭️ Skip';
+            skipBtn.className = 'fix-button skip';
+            skipBtn.style.flex = '1';
+            skipBtn.style.padding = '8px 16px';
+            skipBtn.style.backgroundColor = 'var(--vscode-button-secondaryBackground)';
+            skipBtn.style.color = 'var(--vscode-button-secondaryForeground)';
+            skipBtn.style.border = 'none';
+            skipBtn.style.borderRadius = '4px';
+            skipBtn.style.cursor = 'pointer';
+            skipBtn.onclick = () => {
+                vscode.postMessage({ command: 'skipFix', fileName: fileName });
+                buttonsDiv.remove();
+            };
+
+            buttonsDiv.appendChild(approveBtn);
+            buttonsDiv.appendChild(skipBtn);
+
+            // Add "Apply All" button only after last file
+            if (fileNum === totalFiles) {
+                const applyAllBtn = document.createElement('button');
+                applyAllBtn.textContent = '⚡ Apply All & Rebuild';
+                applyAllBtn.className = 'fix-button apply-all';
+                applyAllBtn.style.flex = '1';
+                applyAllBtn.style.padding = '8px 16px';
+                applyAllBtn.style.backgroundColor = '#007ACC';
+                applyAllBtn.style.color = 'white';
+                applyAllBtn.style.border = 'none';
+                applyAllBtn.style.borderRadius = '4px';
+                applyAllBtn.style.cursor = 'pointer';
+                applyAllBtn.style.fontWeight = 'bold';
+                applyAllBtn.onclick = () => {
+                    vscode.postMessage({ command: 'applyAllFixes' });
+                    // Remove all fix button groups
+                    document.querySelectorAll('.fix-buttons').forEach(el => el.remove());
+                };
+                buttonsDiv.appendChild(applyAllBtn);
+            }
+
+            messagesDiv.appendChild(buttonsDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
 
         // Focus input on load
