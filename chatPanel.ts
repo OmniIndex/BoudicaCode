@@ -1282,6 +1282,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     const blocked = result.interceptedFiles.map(f => `  • ${f}`).join('\n');
                     completionMessage += `\n\n⚠️ **${result.interceptedFiles.length} file(s) were skipped** — the Boudica server's API-connection interceptor returned a config dump for them instead of code:\n${blocked}\n\nTry rephrasing the original request to avoid the trigger words *web*, *oauth*, *api*, *connection*, *endpoint*.`;
                 }
+
+                // If any files failed to generate (timeout, error), warn about those separately
+                if (result.failedFiles && result.failedFiles.length > 0) {
+                    const failed = result.failedFiles.map(f => `  • ${f}`).join('\n');
+                    completionMessage += `\n\n❌ **${result.failedFiles.length} file(s) failed to generate** — the server did not respond within the timeout period:\n${failed}\n\nThese files can be created manually or try generating them again. Common causes: server overload, network timeout, or model size limits.`;
+                }
                 
                 if (this.view) {
                     // Webview is open - show message immediately

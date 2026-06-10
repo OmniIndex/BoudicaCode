@@ -631,9 +631,10 @@ export async function executePlan(
     onProgress?: (step: number, total: number, message: string) => void,
     referenceFileContent?: string,
     referenceFileName?: string
-): Promise<{ success: boolean; filesCreated: string[]; interceptedFiles?: string[] }> {
+): Promise<{ success: boolean; filesCreated: string[]; interceptedFiles?: string[]; failedFiles?: string[] }> {
     const statusBarManager = getStatusBarManager();
     const filesCreated: string[] = [];
+    const failedFiles: string[] = [];
     const headerPublicAPIs = new Map<string, string>(); // Track ONLY public API signatures
 
     // CRITICAL: sanitize the user's original prompt before embedding it in every
@@ -770,6 +771,10 @@ export async function executePlan(
                     }
                 }
                 }
+            } else {
+                // Generation failed (timeout, error, or no response)
+                console.warn(`[PlanExecutor] Failed to generate ${headerFileName} (no response from server)`);
+                failedFiles.push(headerFileName);
             }
             
             // Step 2: Generate implementation with ONLY its header's public API
@@ -809,6 +814,10 @@ export async function executePlan(
                         console.error(`[PlanExecutor] Failed to save ${implFileName}`);
                     }
                     }
+                } else {
+                    // Generation failed (timeout, error, or no response)
+                    console.warn(`[PlanExecutor] Failed to generate ${implFileName} (no response from server)`);
+                    failedFiles.push(implFileName);
                 }
             }
         }
@@ -856,6 +865,10 @@ export async function executePlan(
                     filesCreated.push(mainPath);
                 }
                 }
+            } else {
+                // Generation failed (timeout, error, or no response)
+                console.warn(`[PlanExecutor] Failed to generate ${mainFileName} (no response from server)`);
+                failedFiles.push(mainFileName);
             }
         }
         
@@ -895,6 +908,10 @@ export async function executePlan(
                     fs.writeFileSync(configPath, configContent, 'utf-8');
                     filesCreated.push(configFileName);
                 }
+            } else {
+                // Generation failed (timeout, error, or no response)
+                console.warn(`[PlanExecutor] Failed to generate ${configFileName} (no response from server)`);
+                failedFiles.push(configFileName);
             }
         }
         
@@ -902,14 +919,17 @@ export async function executePlan(
         if (interceptedFiles.length > 0) {
             console.warn(`[PlanExecutor] Server interceptor blocked content for ${interceptedFiles.length} file(s): ${interceptedFiles.join(', ')}`);
         }
+        if (failedFiles.length > 0) {
+            console.warn(`[PlanExecutor] Failed to generate ${failedFiles.length} file(s) (timeouts or errors): ${failedFiles.join(', ')}`);
+        }
         statusBarManager.showSuccess(`Created ${filesCreated.length} files`, 3000);
         
-        return { success: true, filesCreated, interceptedFiles: interceptedFiles.length ? interceptedFiles : undefined };
+        return { success: true, filesCreated, interceptedFiles: interceptedFiles.length ? interceptedFiles : undefined, failedFiles: failedFiles.length ? failedFiles : undefined };
         
     } catch (error: any) {
         statusBarManager.showError('Execution failed');
         console.error('Plan execution error:', error);
-        return { success: false, filesCreated, interceptedFiles: interceptedFiles.length ? interceptedFiles : undefined };
+        return { success: false, filesCreated, interceptedFiles: interceptedFiles.length ? interceptedFiles : undefined, failedFiles: failedFiles.length ? failedFiles : undefined };
     }
 }
 
