@@ -1,0 +1,280 @@
+{
+  "name": "boudicode",
+  "displayName": "BoudiCode - AI-Powered Development Assistant",
+  "description": "VSCode extension connecting to Boudica AI for intelligent project creation, code generation, and security analysis",
+  "version": "1.0.1",
+  "publisher": "OmniIndex",
+  "icon": "resources/boudica-icon.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:boudicodeChat"
+  ],
+  "main": "./out/extension.js",
+  "enabledApiProposals": [
+    "chatVariableResolver",
+    "chatParticipant"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "boudicode.createProject",
+        "title": "BoudiCode: Create New Project",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "boudicode.createApplication",
+        "title": "BoudiCode: Create Application",
+        "icon": "$(file-add)"
+      },
+      {
+        "command": "boudicode.augmentCode",
+        "title": "BoudiCode: Augment Code in Workspace",
+        "icon": "$(extensions)"
+      },
+      {
+        "command": "boudicode.analyzeCode",
+        "title": "BoudiCode: Analyze Code for Issues",
+        "icon": "$(search)"
+      },
+      {
+        "command": "boudicode.openChat",
+        "title": "BoudiCode: Open Chat",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "boudicode.clearDecorations",
+        "title": "BoudiCode: Clear Code Decorations",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "boudicode.configure",
+        "title": "BoudiCode: Configure Connection",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "boudicode.buildProject",
+        "title": "BoudiCode: Build Project",
+        "icon": "$(tools)"
+      },
+      {
+        "command": "boudicode.buildAndRun",
+        "title": "BoudiCode: Build and Run",
+        "icon": "$(run)"
+      },
+      {
+        "command": "boudicode.buildAndFix",
+        "title": "BoudiCode: Build and Fix Errors",
+        "icon": "$(wrench)"
+      },
+      {
+        "command": "boudicode.cleanBuild",
+        "title": "BoudiCode: Clean Build Artifacts",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "boudicode.revertFile",
+        "title": "BoudiCode: Revert File to Backup",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "boudicode.listBackups",
+        "title": "BoudiCode: List File Backups",
+        "icon": "$(history)"
+      },
+      {
+        "command": "boudicode.cleanupBackups",
+        "title": "BoudiCode: Cleanup Old Backups",
+        "icon": "$(clear-all)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "boudicode-sidebar",
+          "title": "BoudiCode",
+          "icon": "resources/boudica-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "boudicode-sidebar": [
+        {
+          "id": "boudicodeChat",
+          "name": "Chat",
+          "type": "webview"
+        }
+      ]
+    },
+    "chatParticipants": [
+      {
+        "id": "boudica",
+        "name": "boudica",
+        "description": "AI-powered code assistant connected to Boudica server",
+        "isSticky": true,
+        "iconPath": "resources/boudica-icon.png",
+        "commands": [
+          {
+            "name": "analyze",
+            "description": "Analyze code for issues, security, or performance"
+          },
+          {
+            "name": "create",
+            "description": "Create new code, functions, or classes"
+          },
+          {
+            "name": "update",
+            "description": "Update or refactor existing code"
+          },
+          {
+            "name": "explain",
+            "description": "Explain code functionality"
+          }
+        ]
+      }
+    ],
+    "configuration": {
+      "title": "BoudiCode",
+      "properties": {
+        "boudicode.apiEndpoint": {
+          "type": "string",
+          "default": "https://boudi.ca/api/boudica",
+          "description": "Boudica API endpoint URL"
+        },
+        "boudicode.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for authentication (optional if using SAML)"
+        },
+        "boudicode.userId": {
+          "type": "string",
+          "default": "",
+          "description": "User ID for session management"
+        },
+        "boudicode.useRag": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable RAG (Retrieval-Augmented Generation) for enhanced responses"
+        },
+        "boudicode.temperature": {
+          "type": "number",
+          "default": 0.8,
+          "minimum": 0.0,
+          "maximum": 2.0,
+          "description": "Temperature for response generation (0.0-2.0)"
+        },
+        "boudicode.maxTokens": {
+          "type": "number",
+          "default": 32000,
+          "minimum": 50,
+          "maximum": 32000,
+          "description": "Maximum tokens for AI responses (model context limit: 32k)"
+        },
+        "boudicode.allowExternalFiles": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow analyzing files outside the current workspace. When disabled, only files within workspace folders can be accessed."
+        },
+        "boudicode.backupDirectory": {
+          "type": "string",
+          "default": ".boudicode/backups",
+          "description": "Directory for file backups, relative to the workspace root. Use an absolute path to store backups outside the workspace."
+        }
+      }
+    },
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "boudicode.createProject"
+        },
+        {
+          "command": "boudicode.createApplication",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "boudicode.augmentCode",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "boudicode.analyzeCode",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "boudicode.openChat"
+        },
+        {
+          "command": "boudicode.clearDecorations"
+        },
+        {
+          "command": "boudicode.configure"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "boudicode.analyzeCode",
+          "when": "editorTextFocus",
+          "group": "boudicode@1"
+        },
+        {
+          "command": "boudicode.augmentCode",
+          "when": "editorTextFocus",
+          "group": "boudicode@2"
+        },
+        {
+          "command": "boudicode.buildAndFix",
+          "when": "editorTextFocus && workspaceFolderCount > 0",
+          "group": "boudicode@3"
+        },
+        {
+          "command": "boudicode.openChat",
+          "when": "editorTextFocus",
+          "group": "boudicode@4"
+        },
+        {
+          "command": "boudicode.revertFile",
+          "when": "editorTextFocus && workspaceFolderCount > 0",
+          "group": "boudicode@5"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "boudicode.analyzeCode",
+          "when": "!explorerResourceIsFolder",
+          "group": "boudicode@1"
+        },
+        {
+          "command": "boudicode.augmentCode",
+          "when": "explorerResourceIsFolder",
+          "group": "boudicode@2"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.x",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "eslint": "^9.0.0",
+    "typescript": "^5.4.5"
+  },
+  "dependencies": {
+    "axios": "^1.6.2",
+    "form-data": "^4.0.0"
+  }
+}

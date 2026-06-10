@@ -71,18 +71,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         context: vscode.WebviewViewResolveContext,
         _token: vscode.CancellationToken,
     ) {
-        console.log('BoudiCode: resolveWebviewView called!');
-        this.view = webviewView;
-        console.log('BoudiCode: Setting webview options...');
+        try {
+            console.log('BoudiCode: resolveWebviewView called!');
+            this.view = webviewView;
+            console.log('BoudiCode: Setting webview options...');
 
-        webviewView.webview.options = {
-            enableScripts: true,
-            localResourceRoots: [this.extensionUri]
-        };
-        console.log('BoudiCode: Generating HTML content...');
+            webviewView.webview.options = {
+                enableScripts: true,
+                localResourceRoots: [this.extensionUri]
+            };
+            console.log('BoudiCode: Generating HTML content...');
 
-        webviewView.webview.html = this.getHtmlContent(webviewView.webview);
-        console.log('BoudiCode: HTML content set, setting up message handler...');
+            const htmlContent = this.getHtmlContent(webviewView.webview);
+            console.log('BoudiCode: HTML generated successfully, length:', htmlContent.length);
+            
+            webviewView.webview.html = htmlContent;
+            console.log('BoudiCode: HTML content set, setting up message handler...');
+        } catch (error) {
+            console.error('BoudiCode: Error in resolveWebviewView:', error);
+            webviewView.webview.html = `<html><body><p style="color: red;">Error initializing chat panel: ${error}</p></body></html>`;
+            return;
+        }
 
         // Route status messages from anywhere in the extension into this webview.
         setStatusWebview(webviewView.webview);
