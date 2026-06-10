@@ -483,33 +483,94 @@ No Memory\n${message}`;
             return new Promise((resolve, reject) => {
                 stream.on('data', (chunk: Buffer) => {
                     buffer += chunk.toString('utf8');
-                    // SSE lines are separated by double-newline: 'data: {...}\n\n'
-                    const parts = buffer.split('\n\n');
-                    buffer = parts.pop() ?? '';
-                    for (const part of parts) {
-                        const line = part.replace(/^data:\s*/m, '').trim();
-                        if (!line || line === '[DONE]') { continue; }
+                    
+                    // Split by newlines to handle newline-delimited JSON (not SSE format with double newlines)
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() ?? ''; // Keep incomplete line in buffer
+                    
+                    for (const line of lines) {
+                        const trimmed = line.replace(/^data:\s*/m, '').trim();
+                        if (!trimmed || trimmed === '[DONE]') { continue; }
+                        
                         try {
-                            const parsed = JSON.parse(line);
-                            const token: string = parsed.token ?? parsed.text ?? parsed.response ?? '';
-                            if (token) { fullText += token; onChunk(token); }
-                            if (parsed.session_id) { sessionId = parsed.session_id; }
-                            if (parsed.tokens_per_second) { tokensPerSecond = parsed.tokens_per_second; }
-                        } catch {
-                            // Non-JSON chunk — treat as raw text
-                            if (line.length > 0) { fullText += line; onChunk(line); }
+                            const parsed = JSON.parse(trimmed);
+                            
+                            // Handle different message types
+                            if (parsed.type === 'start') {
+                                // Ignore start marker
+                                console.log('[DEBUG chatStream] Start marker received');
+                                continue;
+                            } else if (parsed.type === 'token') {
+                                // Token from streaming - accumulate but DON'T stream chunks yet
+                                let token: string = parsed.token ?? '';
+                                if (token) { fullText += token; }
+                            } else if (parsed.response) {
+                                // Final complete response object - extract ONLY the response field
+                                const responseText: string = parsed.response ?? '';
+                                // Don't add to fullText again if we already have tokens from streaming
+                                if (!fullText && responseText) {
+                                    fullText = responseText;
+                                }
+                                if (parsed.session_id) { sessionId = parsed.session_id; }
+                                if (parsed.tokens_per_second) { tokensPerSecond = parsed.tokens_per_second; }
+                                console.log('[DEBUG chatStream] Complete response received, response.length:', responseText.length, 'fullText.length:', fullText.length);
+                            } else {
+                                // Legacy: try to extract token/text/response fields
+                                let token: string = parsed.token ?? parsed.text ?? '';
+                                if (token) { fullText += token; }
+                                if (parsed.session_id) { sessionId = parsed.session_id; }
+                                if (parsed.tokens_per_second) { tokensPerSecond = parsed.tokens_per_second; }
+                            }
+                        } catch (e) {
+                            // Non-JSON chunk — treat as raw text (shouldn't happen with this format)
+                            console.log('[DEBUG chatStream] Non-JSON line:', trimmed.substring(0, 100));
+                            if (trimmed.length > 0) { fullText += trimmed; }
                         }
                     }
                 });
 
                 stream.on('end', () => {
+                    // Process any remaining buffer (should be the final response metadata JSON)
                     if (buffer.trim() && buffer.trim() !== '[DONE]') {
+                        console.log('[DEBUG chatStream] Processing final buffer, fullText.length:', fullText.length, 'buffer.length:', buffer.length, 'buffer start:', buffer.substring(0, 100));
                         try {
-                            const parsed = JSON.parse(buffer.replace(/^data:\s*/m, '').trim());
-                            const token: string = parsed.token ?? parsed.text ?? parsed.response ?? '';
-                            if (token) { fullText += token; onChunk(token); }
-                        } catch { /* ignore partial buffer */ }
+                            const parsed = JSON.parse(buffer.trim());
+                            
+                            // If this is a response object with metadata, extract response field
+                            if (parsed.response && !fullText) {
+                                // Only use if we haven't already built fullText from tokens
+                                fullText = parsed.response;
+                                console.log('[DEBUG chatStream] Extracted response from final buffer, length:', fullText.length);
+                            }
+                            // Always capture session and metrics metadata
+                            if (parsed.session_id) { sessionId = parsed.session_id; }
+                            if (parsed.tokens_per_second) { tokensPerSecond = parsed.tokens_per_second; }
+                            if (parsed.tokens_generated) { console.log('[DEBUG chatStream] Tokens generated:', parsed.tokens_generated); }
+                        } catch (e) {
+                            console.warn('[DEBUG chatStream] Failed to parse final buffer as JSON:', e, 'buffer start:', buffer.substring(0, 200));
+                            // If it's not valid JSON, it might be stray text
+                        }
                     }
+                    
+                    // Clean up stop sequences and markers from accumulated text BEFORE sending to UI
+                    // Remove any variations of end-of-turn markers (they may be split across tokens)
+                    fullText = fullText.replace(/<end_of_turn[>]?/g, '');
+                    fullText = fullText.replace(/<\|end[^>]*>?/g, '');
+                    fullText = fullText.replace(/end_of_turn/g, '');
+                    fullText = fullText.replace(/endoftext/g, '');
+                    // Also handle cases where marker got split into separate pieces
+                    fullText = fullText.replace(/<end_of_turn/g, '');
+                    fullText = fullText.replace(/_of_turn/g, '');
+                    fullText = fullText.trim(); // Remove any trailing whitespace
+                    
+                    console.log('[DEBUG chatStream] Stream ended. fullText.length:', fullText.length, 'sessionId:', sessionId, 'tokensPerSecond:', tokensPerSecond);
+                    console.log('[DEBUG chatStream] Cleaned fullText (last 100 chars):', fullText.slice(-100));
+                    
+                    // NOW send the cleaned text to the UI callback
+                    if (fullText) {
+                        onChunk(fullText);
+                    }
+                    
                     const shouldClean = !request.forCodeGeneration && !request.skipClean;
                     resolve({
                         response: shouldClean ? this.cleanResponse(fullText) : fullText,
